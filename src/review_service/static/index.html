@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#233c36">
+  <title>Review — решения и изменения</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <div id="login" class="login-shell">
+    <form id="login-form" class="login-card">
+      <div class="brand-mark">r.</div>
+      <p class="eyebrow">YOUR CODE, IN CONTEXT</p>
+      <h1>Начнём с понимания.</h1>
+      <p class="muted">Решения, изменения и доказательства — в одном пространстве для review.</p>
+      <label for="token">Токен доступа</label>
+      <input id="token" type="password" autocomplete="current-password" required placeholder="Токен локального сервиса">
+      <p class="hint">Путь к файлу токена указан при запуске сервиса.</p>
+      <button class="primary" type="submit">Открыть workspace <span>↗</span></button>
+      <p id="login-error" role="alert" class="error"></p>
+    </form>
+  </div>
+  <div id="workspace" hidden>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Review workspace"><span class="brand-mark">r.</span><strong>review</strong><span class="brand-divider">/</span><span id="repo-name">workspace</span></a>
+      <div class="top-actions"><span id="connection" class="connection">Подключение…</span><button id="chat-toggle" class="outline">Спросить AI ↗</button><button id="logout" class="quiet" aria-label="Выйти">Выйти</button></div>
+    </header>
+    <div class="layout">
+      <aside class="sidebar">
+        <p class="eyebrow">WORKSPACE</p>
+        <nav id="navigation" aria-label="Навигация">
+          <button data-view="overview" class="nav-button active"><span>◫</span>Обзор<span id="review-count" class="nav-count">0</span></button>
+          <button data-view="changes" class="nav-button"><span>±</span>Изменения<span id="change-count" class="nav-count">0</span></button>
+          <button data-view="sources" class="nav-button"><span>☷</span>Источники</button>
+          <button data-view="history" class="nav-button"><span>↶</span>История действий</button>
+        </nav>
+        <div class="sidebar-note"><span class="small-dot"></span><strong>Локальный review</strong><p>Git-действия выполняются на машине репозитория.</p></div>
+        <div class="sidebar-footer"><span>Снимок</span><code id="snapshot-label">—</code><button id="baseline" class="text-button">Начать новую работу</button></div>
+      </aside>
+      <main id="main">
+        <div class="page-heading"><div><p class="eyebrow">ОТ НАМЕРЕНИЯ К РЕАЛИЗАЦИИ</p><h1 id="page-title">Обзор изменений</h1><p id="page-subtitle" class="muted">Проверьте решения. Соберите следующий коммит.</p></div><div class="heading-actions"><button id="refresh" class="outline">↻ Обновить</button><button id="generate" class="primary">Создать отчёт <span>↗</span></button></div></div>
+        <div id="banner" class="banner" hidden></div>
+        <div id="job-status" class="job-status" hidden></div>
+        <div id="content"></div>
+      </main>
+      <aside id="chat-panel" class="chat-panel" hidden>
+        <div class="chat-header"><div><p class="eyebrow">ASK ABOUT THIS CHANGE</p><h2>Разобраться вместе</h2></div><button id="chat-close" class="quiet" aria-label="Закрыть вопросы">✕</button></div>
+        <p id="chat-context" class="chat-context"></p>
+        <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+        <form id="chat-form"><label for="question" class="sr-only">Вопрос об изменениях</label><textarea id="question" rows="3" required placeholder="Почему реализация корректна?" maxlength="10000"></textarea><div class="chat-form-footer"><span>Ответ относится к снимку</span><button class="primary" type="submit">Спросить ↑</button></div></form>
+      </aside>
+    </div>
+  </div>
+  <dialog id="dialog"><div class="dialog-heading"><h2 id="dialog-title"></h2><button id="dialog-close" class="quiet" aria-label="Закрыть">✕</button></div><div id="dialog-body"></div><div id="dialog-actions" class="dialog-actions"></div></dialog>
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>

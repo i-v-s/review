@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "review-service"
+version = "0.1.0"
+description = "Local, evidence-linked review for agent-assisted development"
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.11,<4",
+  "aiosqlite>=0.20,<1",
+  "openai[aiohttp]>=1.76,<4",
+  "pydantic>=2.10,<3",
+  "socksio>=1,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "pytest-aiohttp>=1,<2", "pytest-playwright>=0.7,<1"]
+
+[project.scripts]
+review-service = "review_service.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/review_service"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["browser: browser integration tests (requires Playwright Chromium)"]
