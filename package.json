@@ -1,0 +1,14 @@
+{
+  "private": true,
+  "scripts": {
+    "build:editor": "esbuild src/review_service/static/review_editor.js --bundle --format=esm --minify --outfile=src/review_service/static/review_editor.bundle.js"
+  },
+  "dependencies": {
+    "@codemirror/merge": "^6.12.1",
+    "@codemirror/view": "^6.38.0",
+    "@codemirror/state": "^6.5.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

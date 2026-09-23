@@ -36,6 +36,32 @@ async def test_api_preserves_snapshot_and_preview(client, service, repo):
     assert (repo / 'example.py').read_text() == 'new\n'
 
 
+async def test_edit_work_file_is_versioned_idempotent_and_undoable(client, service, repo):
+    (repo / 'example.py').write_text('changed\n')
+    snapshot = await service.refresh()
+    body = dict(snapshot_id=snapshot.id, expected_version=snapshot.version, path='example.py',
+                content='edited without final newline', key=uid())
+    response = await client.post('/api/v1/operations/edit', json=body)
+    assert response.status == 200
+    op = await response.json()
+    assert op['action'] == 'edit' and op['changes_work'] and op['status'] == 'completed'
+    assert (repo / 'example.py').read_text() == body['content']
+    assert (await client.post('/api/v1/operations/edit', json=body)).status == 200
+    assert (await client.post('/api/v1/operations/edit', json={**body, 'key': uid()})).status == 409
+    assert (await client.post('/api/v1/operations/edit', json={**body, 'content': 'other'})).status == 409
+    undo = await client.post(f"/api/v1/operations/{op['id']}/undo", json={'key': uid()})
+    assert undo.status == 200
+    assert (repo / 'example.py').read_text() == 'changed\n'
+
+
+async def test_sync_captures_clean_file_for_current_editor(client, service, repo):
+    state = await (await client.post('/api/v1/sync', json={'paths': ['example.py']})).json()
+    file = await (await client.get(f"/api/v1/snapshots/{state['snapshot']['id']}/file",
+                                   params={'path': 'example.py', 'side': 'work'})).json()
+    assert file['content'] == 'one\ntwo\nthree\nfour\n'
+    assert (await client.post('/api/v1/sync', json={'paths': ['../outside']})).status == 400
+
+
 async def test_concurrent_operations_conflict(client, service, repo):
     (repo / 'example.py').write_text('new\n')
     snapshot = await service.refresh()

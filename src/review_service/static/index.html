@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#233c36">
+  <meta name="csp-nonce" content="CSP_NONCE">
   <title>Review — решения и изменения</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/style.css">
@@ -26,6 +27,27 @@
   <div id="workspace" hidden>
     <header class="topbar">
       <a class="brand" href="/" aria-label="Review workspace"><span class="brand-mark">r.</span><strong>review</strong><span class="brand-divider">/</span><span id="repo-name">workspace</span></a>
+      <div class="header-center">
+        <form id="model-form" class="model-settings">
+          <label for="model-input" class="sr-only">Модель для отчётов и чата</label>
+          <div class="model-controls">
+            <input id="model-input" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="model-options" aria-haspopup="listbox" placeholder="Выберите модель или введите ID" maxlength="1024" autocomplete="off" required>
+            <button id="model-open" class="quiet" type="button" aria-label="Показать модели" aria-expanded="false" aria-controls="model-popup">▾</button>
+          </div>
+          <div id="model-popup" class="model-popup" hidden>
+            <div id="model-options" class="model-options" role="listbox" aria-label="Доступные модели"></div>
+            <p id="model-current" class="muted"></p>
+            <p id="model-list-status" class="muted" role="status"></p>
+            <div class="model-popup-actions">
+              <button id="model-apply" class="outline" type="submit">Применить</button>
+              <button id="model-refresh" class="quiet" type="button">Обновить список</button>
+              <button id="model-reset" class="quiet" type="button">Из окружения</button>
+            </div>
+          </div>
+        </form>
+        <div id="overview-metrics" class="overview-metrics" aria-label="Прогресс review"></div>
+        <div class="header-actions"><button id="refresh" class="outline">↻ Обновить</button><button id="generate" class="primary">Создать отчёт <span>↗</span></button></div>
+      </div>
       <div class="top-actions"><span id="connection" class="connection">Подключение…</span><button id="chat-toggle" class="outline">Спросить AI ↗</button><button id="logout" class="quiet" aria-label="Выйти">Выйти</button></div>
     </header>
     <div class="layout">
@@ -41,28 +63,18 @@
         <div class="sidebar-footer"><span>Снимок</span><code id="snapshot-label">—</code><button id="baseline" class="text-button">Начать новую работу</button></div>
       </aside>
       <main id="main">
-        <div class="page-heading"><div><p class="eyebrow">ОТ НАМЕРЕНИЯ К РЕАЛИЗАЦИИ</p><h1 id="page-title">Обзор изменений</h1><p id="page-subtitle" class="muted">Проверьте решения. Соберите следующий коммит.</p></div><div class="heading-actions"><button id="refresh" class="outline">↻ Обновить</button><button id="generate" class="primary">Создать отчёт <span>↗</span></button></div></div>
-        <form id="model-form" class="model-settings">
-          <label for="model-input">Модель для отчётов и чата</label>
-          <div class="model-controls">
-            <input id="model-input" list="model-options" placeholder="Выберите модель или введите ID" maxlength="1024" autocomplete="off" required>
-            <datalist id="model-options"></datalist>
-            <button id="model-apply" class="outline" type="submit">Применить</button>
-            <button id="model-refresh" class="quiet" type="button">Обновить список</button>
-            <button id="model-reset" class="quiet" type="button">Из окружения</button>
-          </div>
-          <p id="model-current" class="muted"></p>
-          <p id="model-list-status" class="muted" role="status"></p>
-        </form>
+        <div class="page-heading"><div><p class="eyebrow">ОТ НАМЕРЕНИЯ К РЕАЛИЗАЦИИ</p><h1 id="page-title">Обзор изменений</h1><p id="page-subtitle" class="muted">Проверьте решения. Соберите следующий коммит.</p></div></div>
         <div id="banner" class="banner" hidden></div>
         <div id="job-status" class="job-status" hidden></div>
         <div id="content"></div>
       </main>
       <aside id="chat-panel" class="chat-panel" hidden>
-        <div class="chat-header"><div><p class="eyebrow">ASK ABOUT THIS CHANGE</p><h2>Разобраться вместе</h2></div><button id="chat-close" class="quiet" aria-label="Закрыть вопросы">✕</button></div>
+        <div class="chat-header"><div><p class="eyebrow">ASK ABOUT THIS CHANGE</p><h2>Разобраться вместе</h2></div><button id="chat-close" class="quiet" aria-label="Свернуть вопросы" aria-expanded="true" aria-controls="chat-body">⌄</button></div>
+        <div id="chat-body" class="chat-body">
         <p id="chat-context" class="chat-context"></p>
         <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
-        <form id="chat-form"><label for="question" class="sr-only">Вопрос об изменениях</label><textarea id="question" rows="3" required placeholder="Почему реализация корректна?" maxlength="10000"></textarea><div class="chat-form-footer"><span>Ответ относится к снимку</span><button class="primary" type="submit">Спросить ↑</button></div></form>
+        <form id="chat-form"><label for="question" class="sr-only">Вопрос об изменениях</label><div id="chat-selections" class="chat-selections"></div><textarea id="question" rows="3" required placeholder="Почему реализация корректна?" maxlength="10000"></textarea><div class="chat-form-footer"><span>Ответ относится к выбранному разделу и снимку</span><button class="primary" type="submit">Спросить ↑</button></div></form>
+        </div>
       </aside>
     </div>
   </div>

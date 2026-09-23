@@ -29,7 +29,7 @@ def validate_references(item, source_ids: set[str], fragment_ids: set[str], path
             raise ValueError(f"Неизвестная ссылка: {path}.dependencies.")
         if item.rationale_kind == "recorded" and not item.source_ids:
             raise ValueError(f"У записанного решения отсутствует источник: {path}.source_ids.")
-        item.reviewed = False
+    item.reviewed = False
 
 
 def preview(text: str, source_ids: set[str], fragment_ids: set[str], prefix: str) -> dict:

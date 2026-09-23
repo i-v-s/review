@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from .git import GitRepo, diff_fragments
 from .llm import LLM
-from .models import OperationRequest, ReviewError, ReviewItem, SourceEvent, digest, now, uid
+from .models import FileEditRequest, FileVersion, OperationRequest, ReviewError, ReviewItem, SourceEvent, digest, now, uid
 from .sources import import_opencode
 from .storage import Store
 
@@ -221,6 +221,48 @@ class Service:
             await self.emit("operation", operation=op)
             return op
 
+    async def edit_file(self, req: FileEditRequest):
+        data = req.content.encode("utf-8")
+        if len(data) > self.config.max_file_bytes:
+            raise ReviewError("Файл превышает допустимый размер")
+        self.git.safe_path(req.path)
+        async with self.git.lock:
+            existing = await self.store.get("operation", req.key)
+            request_hash = digest(req.model_dump_json().encode())
+            if existing:
+                if existing.get("request_hash") != request_hash:
+                    raise ReviewError("Idempotency key already belongs to another operation", 409)
+                return existing
+            snapshot = await self.store.snapshot(req.snapshot_id)
+            if not snapshot or snapshot.version != req.expected_version:
+                raise ReviewError("Unknown or stale snapshot", 409)
+            current = await self.refresh({req.path})
+            if current.version != req.expected_version:
+                raise ReviewError("Repository changed; refresh the diff", 409)
+            file = next((f for f in snapshot.files if f.path == req.path), None)
+            if not file or file.unsupported or file.work.omitted_hash or not file.work.exists:
+                raise ReviewError("Этот файл нельзя редактировать в diff")
+            target = FileVersion.of(data, file.work.mode)
+            target.permissions = file.work.permissions
+            op = dict(id=req.key, request_hash=request_hash, path=req.path, action="edit", changes_work=True,
+                      status="prepared", created_at=now(), before_id=snapshot.id, before_version=snapshot.version,
+                      head=snapshot.head, desired_index_hash=snapshot.index_version,
+                      desired_work_hash=target.fingerprint())
+            await self.store.put("operation", op["id"], op)
+            try:
+                await self.git.write(snapshot, file, target, None)
+                after = await self.refresh({req.path})
+                op.update(status="completed", after_id=after.id, after_version=after.version)
+            except Exception:
+                await self.recover(op)
+                recorded = await self.store.get("operation", op["id"])
+                if recorded["status"] != "completed":
+                    raise
+                op = recorded
+            await self.store.put("operation", op["id"], op)
+            await self.emit("operation", operation=op)
+            return op
+
     async def undo(self, op_id: str, key: str):
         async with self.git.lock:
             duplicate = await self.store.get("operation", key)
@@ -371,6 +413,11 @@ class Service:
         for item in generated.items:
             item.id = uid()
             item.reviewed = self.item_signature(item.model_dump()) in reviewed
+        reviewed_findings = {self.item_signature(finding) for finding in (previous[-1].get("findings", []) if previous else [])
+                             if finding.get("reviewed")}
+        for finding in generated.findings:
+            finding.id = uid()
+            finding.reviewed = self.item_signature(finding.model_dump()) in reviewed_findings
         report = dict(id=draft["report_id"], created_at=now(), snapshot_id=snapshot.id, snapshot_version=snapshot.version,
                       model=model,
                       baseline_id=baseline.id if baseline else None,
@@ -396,39 +443,96 @@ class Service:
             result[f"{fragment['path']} · {fragment['layer']}"].append(fragment)
         return result
 
-    async def chat(self, job_id, question, snapshot_id, report_id, item_id, *, model=None):
+    async def chat(self, job_id, question, snapshot_id, report_id, item_id, *, model=None,
+                   target_kind=None, target_id=None, selections=None):
         model = self.llm.model if model is None else model
         snapshot = await self.store.snapshot(snapshot_id)
         if not snapshot:
             raise ReviewError("Snapshot not found", 404)
         report = await self.store.get("report", report_id) if report_id else None
-        item = next((i for i in report["items"] if i["id"] == item_id), None) if report and item_id else None
+        if target_kind is None:
+            target_kind = "item" if item_id else "all"
+            target_id = item_id
+        if target_kind not in ("all", "summary", "item", "finding"):
+            raise ReviewError("Unknown question target")
+        if target_kind != "all" and not report:
+            raise ReviewError("A report is required for this question")
+        if target_kind in ("item", "finding") and not isinstance(target_id, str):
+            raise ReviewError("Question target ID is required")
+        item = next((i for i in report["items"] if i["id"] == target_id), None) if report and target_kind == "item" else None
+        finding = next((f for f in report.get("findings", []) if f["id"] == target_id), None) if report and target_kind == "finding" else None
         if report and report["snapshot_id"] != snapshot_id:
             raise ReviewError("Report does not match the requested snapshot")
-        if item_id and not item:
+        if target_kind == "item" and not item:
             raise ReviewError("Review item not found", 404)
+        if target_kind == "finding" and not finding:
+            raise ReviewError("Finding not found", 404)
+        if target_kind == "summary" and target_id not in (None, "summary"):
+            raise ReviewError("Invalid summary target")
         fragments = await asyncio.to_thread(diff_fragments, snapshot)
-        if item:
-            relevant = set(item["fragment_ids"] + item.get("dependencies", []))
+        target = item or finding
+        if target:
+            relevant = set(target["fragment_ids"] + target.get("dependencies", []))
             fragments = [f for f in fragments if f["id"] in relevant]
+        selection_context = await self.question_selections(selections or [], snapshot, report, target)
         events = await self.events()
         if report:
             evidence = await self.store.get("report_evidence", report["id"])
             events = evidence["events"] if evidence else []
-        thread = f"{snapshot_id}:{item_id or 'all'}"
+        thread = f"{snapshot_id}:{target_id if target_kind == 'item' else 'all' if target_kind == 'all' else target_kind + ':' + str(target_id or '')}"
         history = [m for m in await self.store.list("message") if m["thread"] == thread and m.get("complete", True)]
-        user = dict(id=uid(), thread=thread, role="user", content=question, created_at=now(), snapshot_id=snapshot_id)
+        user = dict(id=uid(), thread=thread, role="user", content=question, created_at=now(),
+                    snapshot_id=snapshot_id, selections=selection_context)
         await self.store.put("message", user["id"], user)
         message = dict(id=uid(), thread=thread, role="assistant", content="", created_at=now(), snapshot_id=snapshot_id, complete=False, model=model)
         await self.store.put("message", message["id"], message)
         try:
-            async for delta in self.llm.answer(question, fragments, events, history, item, model=model):
+            async for delta in self.llm.answer(question, fragments, events, history, target, model=model,
+                                               selection_context=selection_context,
+                                               summary=report.get("summary") if report and target_kind == "summary" else None):
                 message["content"] += delta
                 await self.emit("chat_delta", job_id=job_id, message_id=message["id"], delta=delta, thread=thread, model=model)
             message["complete"] = True
         finally:
             await self.store.put("message", message["id"], message)
         return dict(message_id=message["id"])
+
+    async def question_selections(self, selections, snapshot, report, target):
+        if not isinstance(selections, list) or len(selections) > 8:
+            raise ReviewError("Select at most 8 context excerpts")
+        result = []
+        for entry in selections:
+            if not isinstance(entry, dict):
+                raise ReviewError("Invalid context excerpt")
+            kind = entry.get("kind")
+            if kind == "report":
+                field, quote = entry.get("field"), entry.get("text")
+                source = report.get("summary", "") if field == "summary" and report else (
+                    target.get(field, "") if target and field in ("title", "explanation", "argument", "description", "suggestion") else "")
+                if not isinstance(quote, str) or not quote or len(quote) > 2000 or quote not in source:
+                    raise ReviewError("Report quote is not in the selected section")
+                result.append(dict(kind="report", field=field, text=quote))
+            elif kind == "code":
+                path, side, start, end = (entry.get(k) for k in ("path", "side", "start", "end"))
+                code_snapshot_id = entry.get("snapshot_id", snapshot.id)
+                code_snapshot = snapshot if code_snapshot_id == snapshot.id else await self.store.snapshot(code_snapshot_id)
+                file = next((f for f in code_snapshot.files if f.path == path), None) if code_snapshot else None
+                if not file or side not in ("head", "index", "work") or file.unsupported:
+                    raise ReviewError("Selected code is unavailable")
+                version = getattr(file, side)
+                lines = version.bytes().decode("utf-8", "replace").splitlines()
+                if not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start or end - start > 80 or end > len(lines):
+                    raise ReviewError("Invalid code line range")
+                result.append(dict(kind="code", snapshot_id=code_snapshot_id, path=path, side=side, start=start, end=end,
+                                   text="\n".join(lines[start - 1:end])))
+            elif kind == "unsaved":
+                excerpt = entry.get("text")
+                if not isinstance(excerpt, str) or not excerpt or len(excerpt) > 2000:
+                    raise ReviewError("Invalid unsaved excerpt")
+                result.append(dict(kind="unsaved", path=str(entry.get("path", ""))[:500], text=excerpt))
+            else:
+                raise ReviewError("Unknown context excerpt kind")
+        return result
 
     async def poll(self):
         while True:

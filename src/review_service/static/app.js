@@ -1,3 +1,5 @@
+import {createDiffEditor} from './review_editor.bundle.js';
+
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const el = (tag, cls = '', text = '') => { const n = document.createElement(tag); n.className = cls; n.textContent = text; return n; };
@@ -11,8 +13,43 @@ let unseen = false, onlyProblems = false, toastTimeout, liveMessages = new Map()
 let reportSelection = sessionStorage.getItem('review-report-selection') || '';
 let loadRevision = 0;
 let modelDirty = false, modelSaving = false, modelCatalogRequested = false, modelCatalogLoading = false, modelCatalogRevision = 0;
+let modelCatalog = [], modelActiveIndex = -1;
+let overviewRoot, overviewRootKey = '', overviewTarget = {kind: 'summary', id: null};
+let overviewFile = null, overviewLayer = null, overviewMode = 'frozen', overviewEditor = null, overviewEditorKey = '';
+let overviewInitialContent = '', overviewUnsaved = false, overviewDiffRevision = 0;
+let overviewSelection = [], overviewLineIds = [], chatTargetKind = 'all', chatTargetId = null;
+let chatExpanded = false, uiRepo = '', overviewSplitRatio = .5, overviewResizeObserver, overviewEditorResizeObserver;
 const draftLabel = draft => draft.status === 'running' ? 'Генерируется' : 'Не завершён';
 function rememberReport(value) { reportSelection = value; sessionStorage.setItem('review-report-selection', value); }
+function uiKey(name) { return `review-ui:${state.repo}:${name}`; }
+function loadUiPreference(name) { try { return localStorage.getItem(uiKey(name)); } catch { return null; } }
+function saveUiPreference(name, value) { try { localStorage.setItem(uiKey(name), String(value)); } catch { /* Storage may be unavailable. */ } }
+function restoreUiPreferences() {
+  if (uiRepo === state.repo) return;
+  uiRepo = state.repo;
+  chatExpanded = loadUiPreference('chat-expanded') === 'true';
+  const savedRatio = loadUiPreference('detail-ratio');
+  const ratio = savedRatio === null ? NaN : Number(savedRatio);
+  overviewSplitRatio = Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : .5;
+  updateChatExpansion();
+}
+function updateChatExpansion() {
+  const panel = $('#chat-panel') || $('#chat-panel', overviewRoot);
+  if (!panel) return;
+  panel.classList.toggle('collapsed', !chatExpanded);
+  $('#chat-body', panel).inert = !chatExpanded;
+  const toggle = $('#chat-close', panel);
+  toggle.textContent = view === 'overview' ? (chatExpanded ? '⌄' : '⌃') : '✕';
+  toggle.setAttribute('aria-label', view === 'overview' ? (chatExpanded ? 'Свернуть вопросы' : 'Развернуть вопросы') : 'Закрыть вопросы');
+  toggle.setAttribute('aria-expanded', String(chatExpanded));
+  $('.overview-center', overviewRoot)?.classList.toggle('chat-collapsed', !chatExpanded);
+  requestAnimationFrame(updateOverviewSplit);
+}
+function setChatExpanded(expanded) {
+  chatExpanded = expanded;
+  if (state) saveUiPreference('chat-expanded', expanded);
+  updateChatExpansion();
+}
 
 async function resolveReport() {
   if (!reportSelection) {
@@ -71,10 +108,44 @@ function modal(title, content, actions = []) {
 }
 $('#dialog-close').onclick = () => $('#dialog').close();
 function empty(title, text) { const box = el('div', 'empty'); box.append(el('div', 'empty-icon', '◫'), el('h2', '', title), el('p', '', text)); return box; }
-function logout() { token = ''; sessionStorage.removeItem('review-token'); streamController?.abort(); modelCatalogRevision++; modelCatalogRequested = false; modelCatalogLoading = false; modelDirty = false; $('#model-options').replaceChildren(); $('#workspace').hidden = true; $('#login').hidden = false; }
+function logout() { token = ''; sessionStorage.removeItem('review-token'); streamController?.abort(); modelCatalogRevision++; modelCatalogRequested = false; modelCatalogLoading = false; modelDirty = false; modelCatalog = []; $('#model-options').replaceChildren(); setModelPopup(false); $('#workspace').hidden = true; $('#login').hidden = false; }
 $('#logout').onclick = logout;
 $('#login-form').onsubmit = async event => { event.preventDefault(); token = $('#token').value.trim(); try { await load(true); sessionStorage.setItem('review-token', token); $('#token').value = ''; connect(); } catch (e) { $('#login-error').textContent = e.message; } };
 
+function setModelPopup(open) {
+  $('#model-popup').hidden = !open;
+  $('#model-input').setAttribute('aria-expanded', String(open));
+  $('#model-open').setAttribute('aria-expanded', String(open));
+  if (!open) { modelActiveIndex = -1; $('#model-input').removeAttribute('aria-activedescendant'); }
+}
+function renderModelOptions() {
+  const query = modelDirty ? $('#model-input').value.trim().toLowerCase() : '';
+  const models = modelCatalog.filter(id => id.toLowerCase().includes(query));
+  const box = $('#model-options');
+  box.replaceChildren(...models.map((id, index) => {
+    const option = button(id, 'model-option', () => chooseModelOption(id));
+    option.id = `model-option-${index}`;
+    option.setAttribute('role', 'option');
+    option.setAttribute('aria-selected', String(id === $('#model-input').value));
+    return option;
+  }));
+  if (!models.length) box.append(el('p', 'model-empty', modelCatalog.length ? 'Совпадений нет. Введите ID вручную.' : 'Введите ID модели вручную.'));
+  modelActiveIndex = -1;
+  $('#model-input').removeAttribute('aria-activedescendant');
+}
+function chooseModelOption(id) {
+  $('#model-input').value = id;
+  modelDirty = true;
+  renderModelOptions(); renderModelSettings();
+  $('#model-input').focus();
+}
+function moveModelOption(direction) {
+  const options = $$('.model-option', $('#model-options'));
+  if (!options.length) return;
+  modelActiveIndex = (modelActiveIndex + direction + options.length) % options.length;
+  $('#model-input').setAttribute('aria-activedescendant', options[modelActiveIndex].id);
+  options[modelActiveIndex].scrollIntoView({block: 'nearest'});
+}
 function renderModelSettings() {
   if (!state) return;
   if (!modelDirty) $('#model-input').value = state.llm_model || '';
@@ -82,13 +153,14 @@ function renderModelSettings() {
     ? `Сейчас: ${state.llm_model || 'модель не выбрана'}. Выбор применяется к новым отчётам и вопросам.`
     : 'Настройте OPENAI_API_KEY и OPENAI_BASE_URL на сервере.';
   $('#model-input').disabled = modelSaving || !state.llm_configured;
+  $('#model-open').disabled = modelSaving || !state.llm_configured;
   $('#model-apply').disabled = modelSaving || !state.llm_configured || !$('#model-input').value.trim();
   $('#model-reset').disabled = modelSaving || !state.llm_configured;
   $('#model-reset').title = state.llm_default_model ? `REVIEW_MODEL: ${state.llm_default_model}` : 'REVIEW_MODEL не задана';
   $('#model-refresh').disabled = modelCatalogLoading || !state.llm_configured;
   $('#generate').disabled = modelSaving || !state.llm_available || state.jobs.some(j => j.kind === 'report' && ['queued', 'running'].includes(j.status));
   $('#generate').title = state.llm_available ? '' : 'Настройте OPENAI_API_KEY и выберите модель';
-  $('#chat-form button[type="submit"]').disabled = modelSaving || !state.llm_available;
+  $('#chat-form button[type="submit"]').disabled = modelSaving || !state.llm_available || (view === 'overview' && Boolean(displayedReport?.is_draft));
 }
 async function refreshModels() {
   const revision = ++modelCatalogRevision;
@@ -97,7 +169,7 @@ async function refreshModels() {
   try {
     const data = await api('/models');
     if (revision !== modelCatalogRevision) return;
-    $('#model-options').replaceChildren(...data.models.map(id => { const option = el('option'); option.value = id; return option; }));
+    modelCatalog = data.models; renderModelOptions();
     $('#model-list-status').textContent = data.models.length ? '' : 'Список пуст. Введите ID модели вручную.';
   } catch (error) {
     if (revision === modelCatalogRevision) $('#model-list-status').textContent = error.message;
@@ -110,20 +182,39 @@ async function saveModel(model) {
   modelSaving = true; renderModelSettings();
   try {
     const result = await api('/model', 'PUT', {model});
-    state.llm_model = result.model; modelDirty = false;
+    state.llm_model = result.model; modelDirty = false; setModelPopup(false);
     await load();
   } finally { modelSaving = false; renderModelSettings(); }
 }
-$('#model-input').oninput = () => { modelDirty = true; renderModelSettings(); };
+$('#model-input').onfocus = () => setModelPopup(true);
+$('#model-input').oninput = () => { modelDirty = true; setModelPopup(true); renderModelOptions(); renderModelSettings(); };
+$('#model-input').onkeydown = event => {
+  if (event.key === 'Escape') { setModelPopup(false); $('#model-input').blur(); event.preventDefault(); }
+  else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    setModelPopup(true); moveModelOption(event.key === 'ArrowDown' ? 1 : -1); event.preventDefault();
+  } else if (event.key === 'Enter' && modelActiveIndex >= 0) {
+    const option = $$('.model-option', $('#model-options'))[modelActiveIndex];
+    if (option) { chooseModelOption(option.textContent); event.preventDefault(); }
+  }
+};
+$('#model-open').onclick = () => { const open = $('#model-popup').hidden; setModelPopup(open); if (open) $('#model-input').focus(); };
 $('#model-form').onsubmit = event => { event.preventDefault(); guard(() => saveModel($('#model-input').value.trim())); };
 $('#model-reset').onclick = () => guard(() => saveModel(null));
 $('#model-refresh').onclick = () => refreshModels();
+$('#model-form').onkeydown = event => { if (event.key === 'Escape') { setModelPopup(false); event.preventDefault(); event.stopPropagation(); } };
+document.addEventListener('pointerdown', event => { if (!$('#model-form').contains(event.target)) setModelPopup(false); });
+const chromeSizeObserver = new ResizeObserver(() => {
+  $('#workspace').style.setProperty('--header-height', `${$('.topbar').offsetHeight}px`);
+  $('#workspace').style.setProperty('--sidebar-height', `${$('.sidebar').offsetHeight}px`);
+});
+chromeSizeObserver.observe($('.topbar')); chromeSizeObserver.observe($('.sidebar'));
 
 async function load(adopt = false) {
   const revision = ++loadRevision;
   const nextState = await api('/state');
   if (revision !== loadRevision) return;
   state = nextState;
+  restoreUiPreferences();
   $('#workspace').hidden = false; $('#login').hidden = true;
   $('#repo-name').textContent = state.repo.split('/').pop(); $('#repo-name').title = state.repo;
   if (adopt || !displayed) {
@@ -143,10 +234,11 @@ async function load(adopt = false) {
   $('#generate').textContent = state.report ? 'Обновить отчёт ↗' : 'Создать отчёт ↗';
   renderModelSettings();
   if (state.llm_configured && !modelCatalogRequested) void refreshModels();
-  renderBanner(); renderJobs(); render(Boolean(displayedReport?.is_draft));
+  overviewProgress(); renderBanner(); renderJobs(); render(Boolean(displayedReport?.is_draft));
 }
 function renderBanner() {
   const banner = $('#banner'); banner.replaceChildren();
+  if (view === 'overview') { banner.hidden = true; return; }
   if (unseen || (displayed && displayed.version !== state.snapshot.version)) {
     banner.append(el('span', '', 'Есть новая версия изменений. Вы просматриваете сохранённый снимок.'), button('Открыть актуальный diff', '', async () => { view = 'changes'; await load(true); updateNav(); }));
     banner.hidden = false;
@@ -176,7 +268,12 @@ function render(preserve = false) {
   const x = window.scrollX, y = window.scrollY;
   $('#page-title').textContent = {overview: 'Обзор изменений', changes: 'Изменения кода', sources: 'Контекст и источники', history: 'История действий'}[view];
   $('#page-subtitle').textContent = {overview: 'Проверьте решения. Соберите следующий коммит.', changes: 'Каждая строка — под вашим контролем.', sources: 'Свяжите реализацию с решениями из сессии.', history: 'Применённые изменения и точки восстановления.'}[view];
-  if (view === 'overview') renderOverview(content);
+  $('#main').classList.toggle('overview-main', view === 'overview');
+  if (view === 'overview') renderOverviewWorkspace(content);
+  else {
+    if ($('#chat-panel').closest('.overview-workspace')) { $('.layout').append($('#chat-panel')); $('#chat-panel').hidden = true; }
+    $('.page-heading').hidden = false;
+  }
   if (view === 'changes') renderChanges(content);
   if (view === 'sources') renderSources(content);
   if (view === 'history') renderHistory(content);
@@ -198,13 +295,358 @@ function render(preserve = false) {
     while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
     window.scrollTo(x, y);
   } else target.replaceChildren(...content.children);
-  $('#chat-toggle').disabled = view === 'overview' && Boolean(displayedReport?.is_draft);
+  $('#chat-toggle').disabled = false;
+  if (view === 'overview') {
+    const expectedReport = displayedReport?.is_draft ? null : displayedReport?.id || null;
+    const expectedKind = expectedReport ? overviewTarget.kind : 'all';
+    const expectedId = expectedReport ? overviewTarget.id : null;
+    if (!chatSnapshot || chatSnapshot !== displayed.id || chatReport !== expectedReport || chatTargetKind !== expectedKind || chatTargetId !== expectedId) {
+      void guard(() => openOverviewChat(false));
+    }
+  }
 }
 function stats(container) {
   const rows = displayed.fragments.flatMap(f => f.rows);
   const data = [[new Set(displayed.fragments.map(f => f.path)).size, 'файлов в снимке', ''], ['+' + rows.filter(r => r.kind === 'add').length, 'добавленных строк', 'green'], ['−' + rows.filter(r => r.kind === 'delete').length, 'удалённых строк', 'red'], [displayedReport?.items.filter(i => i.reviewed).length || 0, 'решений просмотрено', '']];
   const box = el('div', 'stats');
   data.forEach(([value, label, color]) => { const node = el('div', 'stat'); node.append(el('span', 'stat-value ' + color, String(value)), el('span', 'stat-label', label)); box.append(node); }); container.append(box);
+}
+function overviewFragmentsFor(path = overviewFile, layer = overviewLayer, snapshot = displayed) {
+  return (snapshot?.fragments || []).filter(f => f.path === path && f.layer === layer);
+}
+function overviewTargetObject() {
+  if (overviewTarget.kind === 'item') return displayedReport?.items?.find(i => i.id === overviewTarget.id);
+  if (overviewTarget.kind === 'finding') return displayedReport?.findings?.find(f => f.id === overviewTarget.id);
+  return displayedReport;
+}
+function overviewFiles(target) {
+  const ids = target?.fragment_ids ? new Set(target.fragment_ids) : null;
+  return [...new Map(displayed.fragments.filter(f => !ids || ids.has(f.id)).map(f => [f.path + ':' + f.layer, f])).values()];
+}
+function overviewChoose(kind, id = null, file = null, layer = null) {
+  if (overviewUnsaved && !confirm('В редакторе есть несохранённые изменения. Перейти без сохранения?')) return;
+  overviewTarget = {kind, id}; overviewSelection = []; overviewLineIds = [];
+  overviewFile = file; overviewLayer = layer; overviewMode = 'frozen';
+  render(); updateChatSelections();
+}
+function overviewTreeButton(label, kind, id, file = null, layer = null, level = 0, badge = '') {
+  const b = button(label, 'tree-entry level-' + level, () => overviewChoose(kind, id, file, layer));
+  b.classList.toggle('active', overviewTarget.kind === kind && overviewTarget.id === id &&
+    (file ? overviewFile === file && overviewLayer === layer : !overviewFile));
+  if (badge) b.append(el('span', 'tree-badge', badge));
+  b.title = file || label;
+  return b;
+}
+function overviewTreeGroup(tree, label, kind, id, target, level = 0) {
+  const wrap = el('div', 'tree-group');
+  wrap.append(overviewTreeButton(label, kind, id, null, null, level, target?.reviewed ? '✓' : ''));
+  for (const f of overviewFiles(target)) wrap.append(overviewTreeButton(
+    `${f.path} · ${f.layer === 'staged' ? 'staged' : 'working'}`, kind, id, f.path, f.layer, level + 1));
+  tree.append(wrap);
+}
+function overviewProgress() {
+  const total = (displayedReport?.items?.length || 0) + (displayedReport?.findings?.length || 0);
+  const done = [...(displayedReport?.items || []), ...(displayedReport?.findings || [])].filter(x => x.reviewed).length;
+  const rows = state.snapshot.fragments.flatMap(f => f.rows.map(row => ({...row, layer: f.layer})));
+  const staged = rows.filter(r => r.layer === 'staged' && r.id).length;
+  const unstaged = rows.filter(r => r.layer === 'unstaged' && r.id).length;
+  const files = new Set(state.snapshot.fragments.map(f => f.path)).size;
+  const bar = $('#overview-metrics'); bar.replaceChildren();
+  bar.append(el('span', '', `${files} файлов`), el('span', '', `Review ${done}/${total}`),
+    el('span', '', `Staged ${staged}/${staged + unstaged}`));
+  const progress = el('progress'); progress.max = Math.max(1, total); progress.value = done;
+  progress.setAttribute('aria-label', 'Прогресс review'); bar.append(progress);
+  const stagedProgress = el('progress', 'staged-progress'); stagedProgress.max = Math.max(1, staged + unstaged); stagedProgress.value = staged;
+  stagedProgress.setAttribute('aria-label', 'Доля подготовленных строк'); bar.append(stagedProgress);
+}
+function splitSpace() {
+  const center = $('.overview-center', overviewRoot);
+  if (!center?.isConnected) return null;
+  const splitter = $('.overview-splitter', center);
+  const chat = $('.overview-chat-slot', center);
+  return {center, splitter, available: center.clientHeight - splitter.offsetHeight - chat.offsetHeight};
+}
+function updateOverviewSplit() {
+  const space = splitSpace(); if (!space) return;
+  const {center, splitter, available} = space;
+  const overflow = available < 290;
+  center.classList.toggle('split-overflow', overflow);
+  const detailHeight = overflow ? 130 : Math.max(130, Math.min(available - 160, available * overviewSplitRatio));
+  center.style.setProperty('--detail-height', `${detailHeight}px`);
+  splitter.setAttribute('aria-valuemin', String(overflow ? 0 : Math.round(13000 / available)));
+  splitter.setAttribute('aria-valuemax', String(overflow ? 100 : Math.round(100 - 16000 / available)));
+  splitter.setAttribute('aria-valuenow', String(Math.round(100 * (overflow ? .5 : detailHeight / available))));
+  splitter.setAttribute('aria-disabled', String(overflow));
+  overviewEditor?.requestMeasure();
+}
+function setOverviewSplit(height, persist = false) {
+  const space = splitSpace(); if (!space || space.available < 290) return;
+  const clamped = Math.max(130, Math.min(space.available - 160, height));
+  overviewSplitRatio = clamped / space.available;
+  updateOverviewSplit();
+  if (persist) saveUiPreference('detail-ratio', overviewSplitRatio);
+}
+function setupOverviewSplitter(splitter) {
+  splitter.onpointerdown = event => {
+    if (event.button !== 0 || splitSpace()?.available < 290) return;
+    splitter.setPointerCapture(event.pointerId);
+    splitter.classList.add('dragging');
+    event.preventDefault();
+  };
+  splitter.onpointermove = event => {
+    if (!splitter.hasPointerCapture(event.pointerId)) return;
+    setOverviewSplit(event.clientY - splitter.parentElement.getBoundingClientRect().top);
+  };
+  const finish = event => {
+    if (!splitter.hasPointerCapture(event.pointerId)) return;
+    setOverviewSplit(event.clientY - splitter.parentElement.getBoundingClientRect().top, true);
+    splitter.classList.remove('dragging');
+    splitter.releasePointerCapture(event.pointerId);
+  };
+  splitter.onpointerup = finish;
+  splitter.onpointercancel = event => { splitter.classList.remove('dragging'); if (splitter.hasPointerCapture(event.pointerId)) splitter.releasePointerCapture(event.pointerId); };
+  splitter.onkeydown = event => {
+    const space = splitSpace(); if (!space || space.available < 290) return;
+    const current = Math.max(130, Math.min(space.available - 160, space.available * overviewSplitRatio));
+    const step = event.shiftKey ? 50 : 10;
+    const target = event.key === 'ArrowUp' ? current - step : event.key === 'ArrowDown' ? current + step :
+      event.key === 'Home' ? 130 : event.key === 'End' ? space.available - 160 : null;
+    if (target === null) return;
+    event.preventDefault(); setOverviewSplit(target, true);
+  };
+}
+function setupDiffScroll(host) {
+  host.tabIndex = 0;
+  host.setAttribute('aria-label', 'Прокрутка диффа');
+  host.onkeydown = event => {
+    if (event.target !== host) return;
+    const scroller = $('.cm-mergeView', host) || $('.cm-scroller', host);
+    if (!scroller) return;
+    const vertical = event.key === 'ArrowDown' ? 40 : event.key === 'ArrowUp' ? -40 :
+      event.key === 'PageDown' ? scroller.clientHeight : event.key === 'PageUp' ? -scroller.clientHeight : null;
+    if (vertical !== null) { scroller.scrollTop += vertical; event.preventDefault(); return; }
+    if (event.key === 'Home' || event.key === 'End') { scroller.scrollTop = event.key === 'Home' ? 0 : scroller.scrollHeight; event.preventDefault(); return; }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      scroller.scrollLeft += event.key === 'ArrowLeft' ? -40 : 40; event.preventDefault();
+    }
+  };
+}
+function renderOverviewWorkspace(container) {
+  const rootKey = `${reportSelection}:${displayed.id}`;
+  if (!overviewRoot || overviewRootKey !== rootKey) {
+    overviewResizeObserver?.disconnect(); overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; overviewEditorKey = ''; overviewRootKey = rootKey;
+    overviewTarget = {kind: 'summary', id: null}; overviewFile = null; overviewLayer = null;
+    overviewMode = 'frozen'; overviewUnsaved = false; overviewSelection = [];
+    overviewRoot = el('div', 'overview-workspace');
+    const grid = el('div', 'overview-grid');
+    const tree = el('nav', 'overview-tree'); tree.setAttribute('aria-label', 'Дерево отчёта');
+    const center = el('div', 'overview-center');
+    const detail = el('section', 'overview-detail'); detail.id = 'overview-detail';
+    const diff = el('section', 'overview-diff'); diff.id = 'overview-diff';
+    const splitter = el('div', 'overview-splitter'); splitter.tabIndex = 0;
+    splitter.setAttribute('role', 'separator'); splitter.setAttribute('aria-label', 'Разделитель текста и диффа');
+    splitter.setAttribute('aria-orientation', 'horizontal'); splitter.setAttribute('aria-controls', 'overview-detail overview-diff');
+    splitter.setAttribute('aria-valuemin', '0'); splitter.setAttribute('aria-valuemax', '100');
+    setupOverviewSplitter(splitter);
+    center.append(detail, splitter, diff, el('div', 'overview-chat-slot'));
+    grid.append(tree, center); overviewRoot.append(grid);
+    overviewResizeObserver = new ResizeObserver(updateOverviewSplit); overviewResizeObserver.observe(center);
+  }
+  container.append(overviewRoot);
+  $('.page-heading').hidden = true;
+  const chatPanel = $('#chat-panel') || $('#chat-panel', overviewRoot);
+  $('.overview-chat-slot', overviewRoot).append(chatPanel);
+  chatPanel.hidden = false;
+  updateChatExpansion(); overviewProgress();
+  const tree = $('.overview-tree', overviewRoot); tree.replaceChildren();
+  if (state.reports.length || state.report_drafts.length) {
+    const select = el('select', 'overview-report-select'); select.setAttribute('aria-label', 'Версия отчёта');
+    [...state.report_drafts].reverse().forEach(d => { const o = el('option', '', `${draftLabel(d)} · ${new Date(d.created_at).toLocaleString('ru')}`); o.value = 'draft:' + d.id; select.append(o); });
+    [...state.reports].reverse().forEach((r, i) => { const o = el('option', '', `${i === 0 ? 'Последний · ' : ''}${new Date(r.created_at).toLocaleString('ru')}`); o.value = 'report:' + r.id; select.append(o); });
+    select.value = reportSelection;
+    select.onchange = () => guard(async () => { if (overviewUnsaved && !confirm('Сбросить несохранённые правки?')) { select.value = reportSelection; return; } rememberReport(select.value); await load(true); });
+    tree.append(select);
+  }
+  tree.append(el('p', 'eyebrow', 'НАВИГАЦИЯ ПО ОТЧЁТУ'));
+  overviewTreeGroup(tree, 'Описание', 'summary', null, null);
+  if (displayedReport?.findings?.length) {
+    tree.append(el('p', 'tree-heading', `Проблемы · ${displayedReport.findings.length}`));
+    displayedReport.findings.forEach(f => overviewTreeGroup(tree, f.title, 'finding', f.id, f, 0));
+  }
+  if (displayedReport?.items?.length) {
+    let section = '';
+    displayedReport.items.forEach(item => {
+      if (section !== item.section) { section = item.section; tree.append(el('p', 'tree-heading', section)); }
+      overviewTreeGroup(tree, item.title, 'item', item.id, item);
+    });
+  }
+  renderOverviewDetail();
+  void renderOverviewDiff();
+  requestAnimationFrame(updateOverviewSplit);
+}
+function overviewText(parent, label, field, value) {
+  if (!value) return;
+  if (label) parent.append(el('p', 'detail-label', label));
+  const p = el('p', 'prose overview-selectable' + (field === 'summary' ? ' summary-text' : ''), value); p.dataset.reportField = field;
+  p.onmouseup = p.onkeyup = () => {
+    const quote = window.getSelection()?.toString().trim();
+    if (!quote || !value.includes(quote)) return;
+    overviewSelection = overviewSelection.filter(s => s.kind !== 'report');
+    overviewSelection.push({kind: 'report', field, text: quote}); updateChatSelections();
+  };
+  parent.append(p);
+}
+function renderOverviewDetail() {
+  const pane = $('.overview-detail', overviewRoot); pane.replaceChildren();
+  const report = displayedReport, target = overviewTargetObject();
+  const header = el('div', 'overview-pane-header');
+  const title = overviewTarget.kind === 'summary' ? 'Описание' : target?.title || 'Пункт отчёта';
+  header.append(el('h2', '', title));
+  if (overviewTarget.kind !== 'summary' && target && !report?.is_draft) {
+    const label = el('label', 'checkbox-label'); const check = document.createElement('input'); check.type = 'checkbox';
+    check.checked = Boolean(target.reviewed); check.setAttribute('aria-label', 'Просмотрено');
+    check.onchange = () => guard(async () => {
+      const path = overviewTarget.kind === 'finding' ? 'findings' : 'items';
+      await api(`/reports/${report.id}/${path}/${target.id}`, 'PATCH', {reviewed: check.checked});
+      target.reviewed = check.checked; render();
+    });
+    label.append(check, document.createTextNode('Просмотрено')); header.append(label);
+  }
+  pane.append(header);
+  if (!report) { pane.append(empty('Отчёт ещё не создан', 'Создайте отчёт или выберите файл слева, чтобы изучить diff.')); return; }
+  if (report.is_draft) pane.append(el('p', 'overview-notice draft-status', `${draftLabel(report)} · ${report.error || 'Предварительный текст. Отметки станут доступны после завершения.'}`));
+  if (!report.is_draft && displayed.version !== state.snapshot.version) pane.append(el('p', 'overview-notice', 'Отчёт относится к прежнему снимку. Текущий рабочий файл может отличаться.'));
+  if (!report.is_draft && state.report_sources_stale) pane.append(el('p', 'overview-notice', 'Источники изменились после создания отчёта. Обновите отчёт для новых данных.'));
+  if (overviewTarget.kind === 'summary') {
+    overviewText(pane, '', 'summary', report.summary || 'Ожидаем текст от модели…');
+    if (report.model) pane.append(el('p', 'footer-note report-model', `Модель: ${report.model}`));
+  } else if (target) {
+    if (overviewTarget.kind === 'item') {
+      pane.append(tag({recorded: 'Из истории сессии', reconstructed: 'Реконструкция', unknown: 'Причина не зафиксирована'}[target.rationale_kind]));
+      overviewText(pane, 'Объяснение', 'explanation', target.explanation);
+      overviewText(pane, 'Обоснование и проверки', 'argument', target.argument);
+      if (target.limitations?.length) pane.append(el('p', 'footer-note', target.limitations.join(' · ')));
+    } else {
+      pane.append(tag(target.severity, target.severity));
+      overviewText(pane, 'Проблема', 'description', target.description);
+      overviewText(pane, 'Предложение', 'suggestion', target.suggestion);
+    }
+    const links = el('div', 'sources-links'); target.source_ids?.forEach((id, i) => links.append(button(`Источник ${i + 1} ↗`, '', () => showSource(id)))); pane.append(links);
+  }
+  const ask = button('Спросить об этом ↗', 'text-button overview-ask', () => openOverviewChat(true));
+  ask.disabled = Boolean(report.is_draft); pane.append(ask);
+}
+function overviewChangedLines() {
+  return overviewFragmentsFor(overviewFile, overviewLayer, overviewMode === 'live' ? state.snapshot : displayed)
+    .flatMap(f => f.rows).filter(r => r.id);
+}
+function overviewSelectCode(selection) {
+  const snapshot = overviewMode === 'live' ? state.snapshot : displayed;
+  const side = selection.side === 'a' ? (overviewLayer === 'staged' ? 'head' : 'index') : (overviewLayer === 'staged' ? 'index' : 'work');
+  overviewSelection = overviewSelection.filter(s => s.kind !== 'code' && s.kind !== 'unsaved');
+  if (selection.unsaved) overviewSelection.push({kind: 'unsaved', path: overviewFile, text: selection.text.slice(0, 2000)});
+  else overviewSelection.push({kind: 'code', snapshot_id: snapshot.id, path: overviewFile, side,
+                               start: selection.start, end: selection.end});
+  const field = selection.side === 'a' ? 'old' : 'new';
+  overviewLineIds = overviewChangedLines().filter(r => r[field] >= selection.start && r[field] <= selection.end).map(r => r.id);
+  updateChatSelections();
+  const count = $('.overview-line-count', overviewRoot); if (count) count.textContent = `${overviewLineIds.length} строк diff`;
+  overviewUpdateSave();
+}
+function overviewUpdateSave() {
+  const save = $('.overview-save', overviewRoot); if (save) save.disabled = !overviewUnsaved;
+  const stage = $('.overview-stage-lines', overviewRoot); if (stage) stage.disabled = overviewMode !== 'live' || overviewUnsaved || !overviewLineIds.length;
+  const whole = $('.overview-stage-all', overviewRoot); if (whole) whole.disabled = overviewMode !== 'live' || overviewUnsaved;
+}
+async function overviewGitAction(whole) {
+  if (overviewMode !== 'live' || overviewUnsaved) throw new Error('Сначала сохраните текущий файл.');
+  const fragment = overviewFragmentsFor(overviewFile, overviewLayer, state.snapshot)[0];
+  if (!fragment) throw new Error('Для файла нет изменений в выбранном слое.');
+  const action = overviewLayer === 'staged' ? 'unstage' : 'stage';
+  const op = await api('/operations', 'POST', {snapshot_id: state.snapshot.id, expected_version: state.snapshot.version,
+    path: overviewFile, action, line_ids: whole ? [] : overviewLineIds, whole_file: whole, key: key()});
+  if (op.status !== 'completed') throw new Error(op.error || 'Операция не завершена');
+  overviewLineIds = []; overviewSelection = overviewSelection.filter(s => s.kind === 'report');
+  overviewEditorKey = ''; await load(); toast('Готово. Восстановление доступно в истории действий.');
+}
+async function overviewSave() {
+  if (!overviewEditor || !overviewUnsaved || overviewMode !== 'live') return;
+  const op = await api('/operations/edit', 'POST', {snapshot_id: state.snapshot.id,
+    expected_version: state.snapshot.version, path: overviewFile, content: overviewEditor.content, key: key()});
+  if (op.status !== 'completed') throw new Error(op.error || 'Файл не сохранён');
+  overviewUnsaved = false; overviewEditorKey = ''; overviewSelection = overviewSelection.filter(s => s.kind === 'report');
+  await load(); toast('Рабочий файл сохранён. Отчёт относится к прежнему снимку.');
+}
+async function overviewEditCurrent() {
+  if (!overviewFile) return;
+  state = await api('/sync', 'POST', {paths: [overviewFile]});
+  overviewMode = 'live'; overviewEditorKey = ''; overviewLineIds = [];
+  render();
+}
+function updateChatSelections() {
+  const box = $('#chat-selections'); if (!box) return; box.replaceChildren();
+  overviewSelection.forEach((s, index) => {
+    const label = s.kind === 'report' ? `Текст отчёта: ${s.text.slice(0, 45)}` :
+      s.kind === 'unsaved' ? `Несохранённый код: ${s.text.slice(0, 45)}` :
+      `${s.path}:${s.start}–${s.end} · ${s.side}`;
+    box.append(button(label + ' ×', 'context-chip', () => { overviewSelection.splice(index, 1); updateChatSelections(); }));
+  });
+}
+async function renderOverviewDiff() {
+  const pane = $('.overview-diff', overviewRoot); if (!pane) return;
+  const candidates = overviewFiles(overviewTargetObject());
+  if (!overviewFile && candidates.length) { overviewFile = candidates[0].path; overviewLayer = candidates[0].layer; }
+  const snapshot = overviewMode === 'live' ? state.snapshot : displayed;
+  const editorKey = `${snapshot.id}:${overviewFile}:${overviewLayer}:${overviewMode}`;
+  const header = el('div', 'overview-pane-header overview-diff-header');
+  header.append(el('h2', '', overviewFile || 'Diff файла'));
+  if (overviewFile) header.append(tag(overviewMode === 'frozen' ? 'Снимок отчёта' : 'Текущий файл', overviewMode === 'frozen' ? '' : 'warning'));
+  const actions = el('div', 'overview-diff-actions');
+  if (overviewFile) {
+    if (overviewMode === 'frozen') actions.append(button('Редактировать текущий файл ↗', 'outline', overviewEditCurrent));
+    else {
+      actions.append(button('Вернуться к снимку', 'quiet', () => { if (overviewUnsaved && !confirm('Сбросить несохранённые правки?')) return; overviewMode = 'frozen'; overviewUnsaved = false; overviewEditorKey = ''; render(); }));
+      actions.append(button('Сохранить файл', 'primary overview-save', overviewSave));
+      const action = overviewLayer === 'staged' ? 'Unstage' : 'Stage';
+      actions.append(button(`${action} строк`, 'outline overview-stage-lines', () => overviewGitAction(false)));
+      actions.append(button(`${action} файла`, 'outline overview-stage-all', () => overviewGitAction(true)));
+      actions.append(el('span', 'overview-line-count', `${overviewLineIds.length} строк diff`));
+    }
+  }
+  const oldHeader = $('.overview-diff-header', pane);
+  if (oldHeader) oldHeader.replaceWith(header); else pane.prepend(header);
+  const oldActions = $('.overview-diff-actions', pane);
+  if (oldActions) oldActions.replaceWith(actions); else header.after(actions);
+  overviewUpdateSave();
+  let host = $('.overview-editor-host', pane); if (!host) { host = el('div', 'overview-editor-host'); setupDiffScroll(host); pane.append(host); }
+  if (!overviewFile) {
+    overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; overviewEditorKey = '';
+    host.replaceChildren(empty('Выберите файл', 'Файлы находятся в дереве слева.'));
+    return;
+  }
+  if (overviewEditor && editorKey === overviewEditorKey) return;
+  const revision = ++overviewDiffRevision;
+  const sideA = overviewLayer === 'staged' ? 'head' : 'index';
+  const sideB = overviewLayer === 'staged' ? 'index' : 'work';
+  const url = side => `/snapshots/${snapshot.id}/file?path=${encodeURIComponent(overviewFile)}&side=${side}`;
+  const [before, after] = await Promise.all([api(url(sideA)), api(url(sideB))]);
+  if (revision !== overviewDiffRevision || view !== 'overview') return;
+  overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; host.replaceChildren();
+  if (before.unsupported || after.unsupported || before.omitted || after.omitted) {
+    host.append(empty('Файл недоступен для редактора', before.unsupported || after.unsupported || 'Содержимое файла не включено в снимок.'));
+    overviewEditorKey = editorKey; return;
+  }
+  overviewInitialContent = after.content; overviewUnsaved = false; overviewEditorKey = editorKey;
+  overviewEditor = createDiffEditor(host, {before: before.content, after: after.content,
+    editable: overviewMode === 'live' && overviewLayer === 'unstaged' && after.exists,
+    compact: matchMedia('(max-width: 800px)').matches,
+    nonce: $('meta[name="csp-nonce"]').content,
+    onChange: content => { overviewUnsaved = content !== overviewInitialContent; overviewUpdateSave(); },
+    onSelection: overviewSelectCode});
+  overviewEditorResizeObserver = new ResizeObserver(() => overviewEditor?.requestMeasure());
+  overviewEditorResizeObserver.observe(host);
+  if (overviewMode === 'live' && overviewLayer === 'staged') host.append(el('p', 'footer-note', 'Для правки переключитесь на working-слой файла. Staged-слой меняется через Stage/Unstage.'));
+  overviewUpdateSave();
 }
 function renderOverview(container) {
   stats(container);
@@ -359,23 +801,42 @@ function renderHistory(container) {
 }
 
 async function openChat(item = null) {
-  chatItem = item; chatSnapshot = displayed.id; chatReport = item ? displayedReport?.id : null; liveMessages.clear();
-  $('#chat-panel').hidden = false; $('#chat-context').textContent = `${item?.title || 'Все изменения'} · снимок ${displayed.version.slice(0, 8)}`;
+  chatItem = item; chatSnapshot = displayed.id; chatReport = item ? displayedReport?.id : null;
+  chatTargetKind = item ? 'item' : 'all'; chatTargetId = item?.id || null; liveMessages.clear();
+  $('#chat-panel').hidden = false; setChatExpanded(true); $('#chat-context').textContent = `${item?.title || 'Все изменения'} · снимок ${displayed.version.slice(0, 8)}`;
   await loadMessages(); $('#question').focus();
 }
+function chatThread() {
+  return chatSnapshot + ':' + (chatTargetKind === 'item' ? chatTargetId : chatTargetKind === 'all' ? 'all' : chatTargetKind + ':' + (chatTargetId || ''));
+}
+async function openOverviewChat(focus = false) {
+  chatItem = overviewTarget.kind === 'item' ? overviewTargetObject() : null;
+  chatSnapshot = displayed.id;
+  chatReport = displayedReport && !displayedReport.is_draft ? displayedReport.id : null;
+  chatTargetKind = chatReport ? overviewTarget.kind : 'all';
+  chatTargetId = chatReport ? overviewTarget.id : null;
+  liveMessages.clear();
+  $('#chat-panel').hidden = false;
+  if (focus) setChatExpanded(true);
+  $('#chat-context').textContent = `${overviewTarget.kind === 'summary' ? 'Описание' : overviewTargetObject()?.title || 'Все изменения'} · снимок отчёта ${displayed.version.slice(0, 8)}`;
+  updateChatSelections();
+  await loadMessages(); if (focus) $('#question').focus();
+}
 async function loadMessages() {
-  const thread = chatSnapshot + ':' + (chatItem?.id || 'all');
+  const thread = chatThread();
   const data = await api('/messages?thread=' + encodeURIComponent(thread));
   const box = $('#chat-messages'); box.replaceChildren();
   if (!data.messages.length) box.append(el('p', 'footer-note', 'Спросите о причинах решения, граничных случаях или последствиях отмены фрагмента.'));
   data.messages.forEach(message => { const node = el('div', 'message ' + message.role); node.append(el('span', 'role', message.role === 'user' ? 'ВЫ' : 'REVIEW ASSISTANT' + (message.model ? ` · ${message.model}` : ''))); const text = el('span', '', message.content + (message.complete === false ? '\n[Ответ не завершён]' : '')); node.append(text); box.append(node); });
   box.scrollTop = box.scrollHeight;
 }
-$('#chat-toggle').onclick = () => guard(() => openChat());
-$('#chat-close').onclick = () => $('#chat-panel').hidden = true;
+$('#chat-toggle').onclick = () => guard(() => view === 'overview' ? openOverviewChat(true) : openChat());
+$('#chat-close').onclick = () => { if (view !== 'overview') $('#chat-panel').hidden = true; else setChatExpanded(!chatExpanded); };
 $('#chat-form').onsubmit = event => { event.preventDefault(); guard(async () => {
   const question = $('#question').value.trim(); if (!question) return;
-  await api('/questions', 'POST', {question, snapshot_id: chatSnapshot, report_id: chatReport, item_id: chatItem?.id || null});
+  await api('/questions', 'POST', {question, snapshot_id: chatSnapshot, report_id: chatReport,
+    item_id: chatItem?.id || null, target_kind: chatTargetKind, target_id: chatTargetId,
+    selections: view === 'overview' ? overviewSelection : []});
   $('#question').value = ''; const user = el('div', 'message user'); user.append(el('span', 'role', 'ВЫ'), el('span', '', question)); $('#chat-messages').append(user); await load();
 }); };
 
@@ -415,7 +876,7 @@ async function receive(event) {
     if (event.job.kind === 'chat' && !['running', 'queued'].includes(event.job.status) && chatSnapshot) { liveMessages.clear(); await loadMessages(); }
   }
   if (event.type === 'resync') { await load(); if (chatSnapshot) await loadMessages(); }
-  if (event.type === 'chat_delta' && event.thread === chatSnapshot + ':' + (chatItem?.id || 'all')) {
+  if (event.type === 'chat_delta' && event.thread === chatThread()) {
     let text = liveMessages.get(event.message_id);
     if (!text) { const node = el('div', 'message assistant'); node.append(el('span', 'role', 'REVIEW ASSISTANT' + (event.model ? ` · ${event.model}` : ''))); text = el('span'); node.append(text); $('#chat-messages').append(node); liveMessages.set(event.message_id, text); }
     text.textContent += event.delta; $('#chat-messages').scrollTop = $('#chat-messages').scrollHeight;

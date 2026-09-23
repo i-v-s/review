@@ -97,6 +97,7 @@ class Finding(Model):
     suggestion: str = ""
     source_ids: list[str] = Field(default_factory=list)
     fragment_ids: list[str] = Field(default_factory=list)
+    reviewed: bool = False
 
 
 class GeneratedReport(Model):
@@ -112,6 +113,14 @@ class OperationRequest(Model):
     action: Literal["stage", "unstage", "discard"]
     line_ids: list[str] = Field(default_factory=list, max_length=10000)
     whole_file: bool = False
+    key: str = Field(min_length=8, max_length=128)
+
+
+class FileEditRequest(Model):
+    snapshot_id: str
+    expected_version: str
+    path: str
+    content: str
     key: str = Field(min_length=8, max_length=128)
 
 

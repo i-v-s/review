@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from .config import Config
 from .git import GitRepo
 from .llm import LLM
-from .models import OperationRequest, ReviewError, SourceEvent, now, uid
+from .models import FileEditRequest, OperationRequest, ReviewError, SourceEvent, now, uid
 from .service import Service
 from .sources import CodexAdapter, OpenCodeAdapter
 from .storage import Store
@@ -36,7 +36,9 @@ async def errors(request, handler):
         response = web.json_response({"error": f"Invalid request: {str(exc)[:500]}"}, status=400)
     response.headers.update({
         "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+        "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'" +
+                                   (f" 'nonce-{request['csp_nonce']}'" if 'csp_nonce' in request else "") +
+                                   "; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
         "Cache-Control": "no-store",
     })
     return response
@@ -139,8 +141,16 @@ async def imported(request):
 
 async def sync(request):
     service = request.app[SERVICE]
+    body = await request.json() if request.content_length else {}
+    if not isinstance(body, dict):
+        raise ReviewError("Expected a JSON object")
+    paths = body.get("paths", [])
+    if not isinstance(paths, list) or len(paths) > 10 or not all(isinstance(path, str) for path in paths):
+        raise ReviewError("paths must contain at most 10 repository paths")
+    for path in paths:
+        service.git.safe_path(path)
     async with service.git.lock:
-        await service.refresh()
+        await service.refresh(set(paths))
     await service.sync()
     return web.json_response(await service.state())
 
@@ -226,6 +236,20 @@ async def review_mark(request):
     return web.json_response(item)
 
 
+async def finding_mark(request):
+    service = request.app[SERVICE]
+    body = await request.json()
+    report = await service.store.get("report", request.match_info["id"])
+    finding = next((f for f in report.get("findings", []) if f["id"] == request.match_info["finding"]), None) if report else None
+    if not finding:
+        raise ReviewError("Finding not found", 404)
+    if not isinstance(body.get("reviewed"), bool):
+        raise ReviewError("reviewed must be boolean")
+    finding["reviewed"] = body["reviewed"]
+    await service.store.put("report", report["id"], report)
+    return web.json_response(finding)
+
+
 async def sources(request):
     service = request.app[SERVICE]
     if request.query.get("draft_id"):
@@ -258,6 +282,11 @@ async def operation(request):
     return web.json_response(await request.app[SERVICE].operation(req, preview=request.path.endswith("/preview")))
 
 
+async def edit_file(request):
+    req = FileEditRequest.model_validate(await request.json())
+    return web.json_response(await request.app[SERVICE].edit_file(req))
+
+
 async def undo(request):
     body = await request.json()
     key = body.get("key")
@@ -276,7 +305,9 @@ async def chat(request):
         raise ReviewError("Настройте OPENAI_API_KEY и выберите модель в интерфейсе или REVIEW_MODEL.", 503)
     model = service.llm.model
     return web.json_response(await service.start_job("chat", lambda id: service.chat(
-        id, question, body["snapshot_id"], body.get("report_id"), body.get("item_id"), model=model)), status=202)
+        id, question, body["snapshot_id"], body.get("report_id"), body.get("item_id"), model=model,
+        target_kind=body.get("target_kind"), target_id=body.get("target_id"),
+        selections=body.get("selections"))), status=202)
 
 
 async def messages(request):
@@ -318,7 +349,10 @@ async def events(request):
 
 
 async def index(request):
-    return web.FileResponse(STATIC / "index.html")
+    nonce = secrets.token_urlsafe(18)
+    request["csp_nonce"] = nonce
+    html = (STATIC / "index.html").read_text().replace('content="CSP_NONCE"', f'content="{nonce}"')
+    return web.Response(text=html, content_type="text/html")
 
 
 async def shutdown(app):
@@ -346,8 +380,10 @@ def create_app(config: Config) -> web.Application:
         web.get("/api/v1/reports/{id}", report_get), web.post("/api/v1/reports", report_generate),
         web.get("/api/v1/report-drafts/{id}", draft_get),
         web.patch("/api/v1/reports/{id}/items/{item}", review_mark),
+        web.patch("/api/v1/reports/{id}/findings/{finding}", finding_mark),
         web.get("/api/v1/sources", sources), web.post("/api/v1/decisions", decision),
         web.post("/api/v1/operations/preview", operation), web.post("/api/v1/operations", operation),
+        web.post("/api/v1/operations/edit", edit_file),
         web.post("/api/v1/operations/{id}/undo", undo),
         web.post("/api/v1/questions", chat), web.get("/api/v1/messages", messages),
         web.post("/api/v1/jobs/{id}/cancel", job_cancel), web.get("/api/v1/events", events),
