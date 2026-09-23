@@ -178,9 +178,9 @@ async def test_report_start_and_reload_do_not_fetch_an_unsaved_draft(client, ser
     ready = asyncio.Event()
     original_generate = service._generate
 
-    async def delayed_generate(job_id):
+    async def delayed_generate(job_id, *, model):
         await ready.wait()
-        return await original_generate(job_id)
+        return await original_generate(job_id, model=model)
 
     monkeypatch.setattr(service, '_generate', delayed_generate)
     async with async_playwright() as p:
@@ -217,10 +217,7 @@ async def test_report_start_and_reload_do_not_fetch_an_unsaved_draft(client, ser
 async def test_reload_of_job_without_a_draft_uses_saved_report(client, service, repo, fake_llm, status):
     (repo / 'example.py').write_text('changed\n')
     llm = await attach(service, fake_llm)
-    try:
-        saved = await service.generate('saved')
-    finally:
-        await llm.close()
+    saved = await service.generate('saved')
     job = {'id': 'without-draft', 'kind': 'report', 'status': status}
     if status == 'completed':
         job['result'] = saved
@@ -241,3 +238,69 @@ async def test_reload_of_job_without_a_draft_uses_saved_report(client, service, 
             assert console_errors == []
         finally:
             await browser.close()
+            await llm.close()
+
+
+@pytest.mark.browser
+@pytest.mark.parametrize('viewport', [{'width': 1440, 'height': 1000}, {'width': 390, 'height': 844}])
+async def test_model_selection_streaming_manual_entry_and_reload(client, service, repo, fake_llm, viewport):
+    (repo / 'example.py').write_text('changed\n')
+    llm = await attach(service, fake_llm)
+    control = fake_llm[1]
+    control['before_finish'] = asyncio.Event()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(executable_path=os.environ.get('REVIEW_TEST_BROWSER'))
+        context = await browser.new_context(viewport=viewport, is_mobile=viewport['width'] < 700,
+                                            has_touch=viewport['width'] < 700)
+        await context.add_init_script("sessionStorage.setItem('review-token', 'test-secret');")
+        page = await context.new_page()
+        other = await context.new_page()
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        try:
+            await page.goto(str(client.make_url('/')))
+            await other.goto(str(client.make_url('/')))
+            await expect(page.get_by_label('Модель для отчётов и чата')).to_have_value('test-model')
+            await expect(page.locator('#model-options option[value="other-model"]')).to_have_count(1)
+            await page.get_by_label('Модель для отчётов и чата').fill('other-model')
+            await page.get_by_role('button', name='Применить', exact=True).click()
+            await expect(page.locator('#model-current')).to_contain_text('Сейчас: other-model')
+            await expect(other.get_by_label('Модель для отчётов и чата')).to_have_value('other-model')
+            await page.locator('#generate').click()
+            await expect(page.locator('.draft-status')).to_contain_text('Генерируется')
+            await expect(page.locator('.report-model')).to_have_text('Модель: other-model')
+
+            control['models_status'] = 503
+            await page.get_by_role('button', name='Обновить список').click()
+            await expect(page.locator('#model-list-status')).to_contain_text('HTTP 503')
+            await page.get_by_label('Модель для отчётов и чата').fill('manual-model')
+            await page.get_by_role('button', name='Применить', exact=True).click()
+            await expect(page.locator('#model-current')).to_contain_text('Сейчас: manual-model')
+            control['before_finish'].set()
+            await expect(page.locator('.draft-status')).to_have_count(0)
+            await expect(page.locator('.report-model')).to_have_text('Модель: other-model')
+            await page.locator('#generate').click()
+            await expect(page.locator('.report-model')).to_have_text('Модель: manual-model')
+            await expect(page.locator('.draft-status')).to_have_count(0)
+
+            await page.locator('#chat-toggle').click()
+            await page.get_by_label('Вопрос об изменениях').fill('Что проверить?')
+            await page.get_by_role('button', name='Спросить ↑').click()
+            await expect(page.locator('.message.assistant')).to_contain_text('manual-model')
+            await expect(page.locator('.message.assistant')).to_contain_text('Проверка граничных случаев необходима.')
+            await page.locator('#chat-close').click()
+            assert [request['model'] for request in control['requests']] == ['other-model', 'manual-model', 'manual-model']
+
+            await page.reload()
+            await expect(page.get_by_label('Модель для отчётов и чата')).to_have_value('manual-model')
+            await expect(page.locator('.report-model')).to_have_text('Модель: manual-model')
+            await page.screenshot(path=f"test-results/model-{viewport['width']}.png", full_page=True)
+            await page.get_by_role('button', name='Из окружения').click()
+            await expect(page.get_by_label('Модель для отчётов и чата')).to_have_value('test-model')
+            await expect(other.get_by_label('Модель для отчётов и чата')).to_have_value('test-model')
+            assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+            assert errors == []
+        finally:
+            control['before_finish'].set()
+            await browser.close()
+            await llm.close()

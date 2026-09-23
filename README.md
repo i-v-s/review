@@ -30,7 +30,33 @@ recovery copies. Keep it until review and recovery are no longer needed.
 Without LLM configuration, Git operations, snapshots, source import and saved reports
 still work. No background LLM requests are made. Report generation and questions use
 Chat Completions, so the provider must implement streaming requests
-with `model`, `messages`, and `max_tokens`. JSON schema support is not required.
+with `model`, `messages`, and `max_tokens`. Reports use JSON Schema structured output
+by default through `response_format: {type: "json_schema", json_schema: {name,
+strict: true, schema}}`, supported by llama-server. Each request's schema restricts
+source and fragment references to the evidence actually supplied in that request.
+The server still validates the result and permits one repair attempt. Validation
+errors identify the failed portion and field; failed generations preserve the draft
+and previous report.
+
+For a provider without JSON Schema support, set `REVIEW_LLM_STRUCTURED_OUTPUT=0`
+and restart. Only `0` and `1` are accepted. This omits `response_format` while keeping
+the schema in the prompt and all local checks. A provider error never silently disables
+structured output. Questions continue to use plain-text streaming.
+
+Use **Модель для отчётов и чата** to choose a model from the configured provider's
+list or enter its ID, then select **Применить**. The list is fetched after login and
+with **Обновить список**, with a ten-second timeout and no transport retries.
+If the catalog is empty or unavailable, manual entry remains available. LLM credentials
+and proxy configuration stay on the server; the browser receives model IDs only.
+Listing models does not generate completions.
+
+The choice applies to new reports and questions and is saved per repository and provider
+URL across browser reloads and service restarts. It overrides `REVIEW_MODEL` until
+**Из окружения** resets it. `REVIEW_MODEL` can be omitted if a model is chosen in the UI;
+the API key and provider URL must still be configured on the server. Changing the model
+does not alter running jobs: every portion and repair uses the model selected when the
+job was accepted. Reports, drafts and chat answers show the model used; older artifacts
+without model metadata remain readable. Other connected tabs receive selection updates.
 
 An LLM request may wait for 600 seconds by default. For reports, this also limits the
 entire response stream for each attempt, including any configured transport retries.
@@ -52,7 +78,7 @@ export REVIEW_LLM_PROXY='socks5h://user:password@127.0.0.1:1080'
 Restart the service after changing this setting. Percent-encode special characters
 in credentials, for example `user%40name:pass%3Aword`. The port is required. Both
 schemes send the provider hostname to the proxy for resolution. This setting applies
-to report generation and questions only; session adapters and Git use their own
+to report generation, questions and model discovery only; session adapters and Git use their own
 connections. A failed proxy connection does not fall back to a direct connection.
 Proxy credentials are not included in browser state or user-facing error messages.
 An empty setting keeps the existing transport. Update an existing installation with
@@ -172,6 +198,7 @@ All `/api/v1` routes require `Authorization: Bearer <browser-token>`.
 | Routes | Purpose |
 | --- | --- |
 | `GET /state`, `POST /sync` | Current snapshot, reports, jobs and operation journal |
+| `GET /models`, `PUT /model` | Discover provider model IDs; select a model for new reports and questions |
 | `GET/PUT /sessions`, `POST /import`, `GET /sources` | Discover/select sessions, import OpenCode history, inspect evidence |
 | `POST /reviews`, `POST /untracked`, `POST /decisions` | Start a baseline, include new files, record a decision |
 | `GET /snapshots/{id}`, `GET /snapshots/{id}/file` | Immutable diff and file context (`path`, `side` query parameters) |
@@ -189,6 +216,16 @@ increasing `revision`, and a full `draft` replacement. Clients can restore the l
 saved version after reconnecting or receiving `resync`. Draft statuses are `running`,
 `completed`, `failed`, `cancelled`, and `interrupted`; completed drafts link to their
 published `report_id`. `/sources?draft_id=JOB_ID` retrieves the draft's frozen sources.
+
+`/state` also includes `llm_model`, `llm_default_model` (the startup `REVIEW_MODEL`)
+and `llm_configured` (whether a provider API key is configured). `llm_available`
+requires both the provider configuration and a selected model. `GET /models` returns
+`{models: [ID, ...]}`; catalog errors do not change the selection. `PUT /model`
+accepts `{model: ID}` (a nonempty string of at most 1024 characters) or `{model: null}`
+to reset to the environment default, and returns `{model: effective_ID}`. An ID need
+not appear in the catalog. Successful changes emit a `model_changed` SSE event;
+clients reload `/state`. New report/chat jobs, drafts, reports and assistant messages
+include the frozen `model` ID. These are additive fields; no database migration is needed.
 
 An operation supplies `snapshot_id`, `expected_version`, `path`, `action`
 (`stage`, `unstage`, `discard`), `line_ids`, `whole_file` and a unique `key`.

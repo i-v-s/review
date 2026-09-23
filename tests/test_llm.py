@@ -20,7 +20,9 @@ async def fake_llm(aiohttp_server):
     control = {'invalid': False, 'invalid_json': False, 'status': 200, 'delay': 0,
                'chunk_delay': 0, 'requests': [], 'finish_reason': 'stop', 'before_finish': None,
                'paused': asyncio.Event(), 'pieces': None, 'repair': False, 'piece_gates': {},
-               'error_message': 'Simulated provider failure'}
+               'error_message': 'Simulated provider failure', 'report_patch': {},
+               'models': ['test-model', 'other-model'], 'models_status': 200,
+               'models_delay': 0, 'model_requests': 0}
     async def handler(request):
         body = await request.json()
         control['requests'].append(body)
@@ -36,8 +38,10 @@ async def fake_llm(aiohttp_server):
             report = {'summary': 'Добавлена обработка граничных случаев.', 'items': [
                 {'section': 'Корректность', 'title': 'Сохраняем инвариант', 'explanation': 'Разбираем изменение поведения.',
                  'rationale_kind': 'recorded' if source_ids else 'reconstructed', 'argument': 'Нужна проверка.',
+                 'limitations': [], 'dependencies': [],
                  'source_ids': source_ids, 'fragment_ids': ['invented' if invalid else fragment['id']]}
             ], 'findings': []}
+            report.update(control['report_patch'])
             content = 'not JSON' if control['invalid_json'] else json.dumps(report, ensure_ascii=False)
             pieces = control['pieces'] or [content[n:n + 31] for n in range(0, len(content), 31)]
         else:
@@ -67,6 +71,14 @@ async def fake_llm(aiohttp_server):
         return response
     app = web.Application()
     app.router.add_post('/v1/chat/completions', handler)
+    async def models(request):
+        control['model_requests'] += 1
+        await asyncio.sleep(control['models_delay'])
+        if control['models_status'] != 200:
+            return web.json_response({'error': {'message': control['error_message']}}, status=control['models_status'])
+        return web.json_response({'object': 'list', 'data': [
+            {'id': id, 'object': 'model', 'created': 1, 'owned_by': 'test'} for id in control['models']]})
+    app.router.add_get('/v1/models', models)
     server = await aiohttp_server(app)
     return str(server.make_url('/v1')), control
 
@@ -101,7 +113,7 @@ async def test_invented_references_rejected(service, repo, fake_llm):
     fake_llm[1]['invalid'] = True
     llm = await attach(service, fake_llm)
     try:
-        with pytest.raises(ReviewError, match='invented'):
+        with pytest.raises(ReviewError, match='Неизвестная ссылка: items.0.fragment_ids'):
             await service.generate('job')
         assert not await service.store.list('report')
         assert len(fake_llm[1]['requests']) == 2
@@ -237,3 +249,89 @@ async def test_chat_http_error_includes_status_and_redacts_credentials(service, 
         assert 'Проверьте адрес, доступность и авторизацию прокси' not in error
     finally:
         await llm.close()
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+async def test_report_format_is_sent_on_initial_and_repair_but_not_chat(service, fake_llm, enabled):
+    service.config.llm_structured_output = enabled
+    fake_llm[1].update(invalid=True, repair=True)
+    llm = await attach(service, fake_llm)
+    async def progress(_):
+        pass
+    try:
+        await llm.report([{'id': 'f1'}], [], progress)
+        requests = fake_llm[1]['requests']
+        assert len(requests) == 2
+        for request in requests:
+            assert ('response_format' in request) == enabled
+            if enabled:
+                wrapper = request['response_format']
+                assert wrapper['type'] == 'json_schema'
+                assert wrapper['json_schema']['strict'] is True
+                schema = wrapper['json_schema']['schema']
+                assert schema['$defs']['ReviewItem']['properties']['fragment_ids']['items']['enum'] == ['f1']
+                assert json.loads(request['messages'][0]['content'].split('findings:\n')[1]) == schema
+        _ = [part async for part in llm.answer('Q', [], [], [], None)]
+        assert 'response_format' not in requests[-1]
+    finally:
+        await llm.close()
+
+
+@pytest.mark.parametrize('failure,detail', [
+    ('json', 'Некорректный JSON'), ('structure', 'Нарушена структура отчёта: items.0.title'),
+    ('source_ids', 'Неизвестная ссылка: items.0.source_ids'),
+    ('dependencies', 'Неизвестная ссылка: items.0.dependencies'),
+    ('recorded', 'У записанного решения отсутствует источник: items.0.source_ids'),
+])
+async def test_validation_diagnostics_preserve_previous_report(service, repo, fake_llm, failure, detail):
+    (repo / 'example.py').write_text('changed\n')
+    llm = await attach(service, fake_llm)
+    try:
+        previous = await service.generate('previous')
+        item = {'section': 'S', 'title': 'T', 'explanation': 'E'}
+        if failure == 'json':
+            fake_llm[1]['invalid_json'] = True
+        elif failure == 'structure':
+            item.pop('title')
+        elif failure == 'recorded':
+            item['rationale_kind'] = 'recorded'
+        else:
+            item[failure] = ['invented-secret-text']
+        fake_llm[1]['report_patch'] = {'items': [item]}
+        job = await service.start_job('report', service.generate)
+        await asyncio.wait_for(service.tasks[job['id']], 5)
+        failed = await service.store.get('job', job['id'])
+        draft = await service.store.get('report_draft', job['id'])
+        assert failed['status'] == draft['status'] == 'failed'
+        assert detail in failed['error'] == draft['error']
+        assert 'порция 1/1' in failed['error'] and 'test-model' in failed['error']
+        assert 'invented-secret-text' not in failed['error']
+        assert detail in fake_llm[1]['requests'][-1]['messages'][-1]['content']
+        assert [r['id'] for r in await service.store.list('report')] == [previous['report_id']]
+        assert len(fake_llm[1]['requests']) == 3
+    finally:
+        await llm.close()
+
+
+async def test_schema_rejection_has_opt_out_hint_without_retry(service, repo, fake_llm):
+    (repo / 'example.py').write_text('changed\n')
+    llm = await attach(service, fake_llm)
+    fake_llm[1].update(status=400, error_message='response_format unsupported')
+    try:
+        with pytest.raises(ReviewError, match='REVIEW_LLM_STRUCTURED_OUTPUT=0'):
+            await service.generate('job')
+        assert len(fake_llm[1]['requests']) == 1
+    finally:
+        await llm.close()
+
+
+@pytest.mark.parametrize('value,expected', [(None, True), ('1', True), ('0', False)])
+def test_structured_output_configuration(monkeypatch, tmp_path, value, expected):
+    if value is None:
+        monkeypatch.delenv('REVIEW_LLM_STRUCTURED_OUTPUT', raising=False)
+    else:
+        monkeypatch.setenv('REVIEW_LLM_STRUCTURED_OUTPUT', value)
+    assert Config.from_env(tmp_path / 'repo', state_dir=tmp_path / 'state').llm_structured_output is expected
+    monkeypatch.setenv('REVIEW_LLM_STRUCTURED_OUTPUT', 'typo')
+    with pytest.raises(ValueError, match='REVIEW_LLM_STRUCTURED_OUTPUT'):
+        Config.from_env(tmp_path / 'repo', state_dir=tmp_path / 'state')

@@ -104,6 +104,17 @@ async def state(request):
     return web.json_response(await request.app[SERVICE].state())
 
 
+async def models(request):
+    return web.json_response({"models": await request.app[SERVICE].llm.models()})
+
+
+async def select_model(request):
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {"model"}:
+        raise ReviewError("Ожидается поле model: ID модели или null для значения из окружения.")
+    return web.json_response(await request.app[SERVICE].select_model(body["model"]))
+
+
 async def sessions(request):
     return web.json_response(await request.app[SERVICE].sessions())
 
@@ -196,8 +207,9 @@ async def draft_get(request):
 async def report_generate(request):
     service = request.app[SERVICE]
     if not service.llm.available:
-        raise ReviewError("Configure OPENAI_API_KEY and REVIEW_MODEL", 503)
-    return web.json_response(await service.start_job("report", service.generate), status=202)
+        raise ReviewError("Настройте OPENAI_API_KEY и выберите модель в интерфейсе или REVIEW_MODEL.", 503)
+    model = service.llm.model
+    return web.json_response(await service.start_job("report", lambda id: service.generate(id, model=model)), status=202)
 
 
 async def review_mark(request):
@@ -261,9 +273,10 @@ async def chat(request):
     if not isinstance(question, str) or not 1 <= len(question.strip()) <= 10000:
         raise ReviewError("Question must contain 1–10000 characters")
     if not service.llm.available:
-        raise ReviewError("Configure OPENAI_API_KEY and REVIEW_MODEL", 503)
+        raise ReviewError("Настройте OPENAI_API_KEY и выберите модель в интерфейсе или REVIEW_MODEL.", 503)
+    model = service.llm.model
     return web.json_response(await service.start_job("chat", lambda id: service.chat(
-        id, question, body["snapshot_id"], body.get("report_id"), body.get("item_id"))), status=202)
+        id, question, body["snapshot_id"], body.get("report_id"), body.get("item_id"), model=model)), status=202)
 
 
 async def messages(request):
@@ -325,6 +338,7 @@ def create_app(config: Config) -> web.Application:
     app.add_routes([
         web.get("/", index), web.static("/static", STATIC),
         web.get("/api/v1/state", state), web.get("/api/v1/sessions", sessions),
+        web.get("/api/v1/models", models), web.put("/api/v1/model", select_model),
         web.put("/api/v1/sessions", select_sessions), web.post("/api/v1/import", imported),
         web.post("/api/v1/sync", sync), web.post("/api/v1/reviews", review_start),
         web.post("/api/v1/untracked", untracked),

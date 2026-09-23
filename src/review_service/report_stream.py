@@ -20,14 +20,15 @@ def report_json(text: str) -> str:
     return text
 
 
-def validate_references(item, source_ids: set[str], fragment_ids: set[str]):
-    if not set(item.source_ids) <= source_ids or not set(item.fragment_ids) <= fragment_ids:
-        raise ValueError("Unknown source or fragment reference")
+def validate_references(item, source_ids: set[str], fragment_ids: set[str], path: str = "item"):
+    for field, allowed in (("source_ids", source_ids), ("fragment_ids", fragment_ids)):
+        if not set(getattr(item, field)) <= allowed:
+            raise ValueError(f"Неизвестная ссылка: {path}.{field}.")
     if isinstance(item, ReviewItem):
         if not set(item.dependencies) <= fragment_ids:
-            raise ValueError("Unknown dependency reference")
+            raise ValueError(f"Неизвестная ссылка: {path}.dependencies.")
         if item.rationale_kind == "recorded" and not item.source_ids:
-            raise ValueError("Recorded decisions require source references")
+            raise ValueError(f"У записанного решения отсутствует источник: {path}.source_ids.")
         item.reviewed = False
 
 

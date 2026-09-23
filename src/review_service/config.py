@@ -27,6 +27,7 @@ class Config:
     max_output_tokens: int = 8192
     llm_timeout_seconds: float = 600.0
     llm_max_retries: int = 0
+    llm_structured_output: bool = True
     llm_proxy: str = field(default="", repr=False)
 
     def __post_init__(self):
@@ -56,6 +57,9 @@ class Config:
 
     @classmethod
     def from_env(cls, repo: Path, **overrides):
+        structured = os.environ.get("REVIEW_LLM_STRUCTURED_OUTPUT", "1")
+        if structured not in ("0", "1"):
+            raise ValueError("REVIEW_LLM_STRUCTURED_OUTPUT: ожидается 0 или 1")
         values = dict(
             api_key=os.environ.get("OPENAI_API_KEY", ""),
             base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
@@ -63,6 +67,7 @@ class Config:
             token=os.environ.get("REVIEW_TOKEN"),
             llm_timeout_seconds=float(os.environ.get("REVIEW_LLM_TIMEOUT_SECONDS", "600")),
             llm_max_retries=int(os.environ.get("REVIEW_LLM_MAX_RETRIES", "0")),
+            llm_structured_output=structured == "1",
             llm_proxy=os.environ.get("REVIEW_LLM_PROXY", ""),
             max_context_chars=int(os.environ.get("REVIEW_MAX_CONTEXT_CHARS", "100000")),
             max_output_tokens=int(os.environ.get("REVIEW_MAX_OUTPUT_TOKENS", "8192")),

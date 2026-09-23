@@ -10,6 +10,7 @@ let sourceCache = [], chosenSessionList = [], chatItem = null, chatSnapshot = nu
 let unseen = false, onlyProblems = false, toastTimeout, liveMessages = new Map();
 let reportSelection = sessionStorage.getItem('review-report-selection') || '';
 let loadRevision = 0;
+let modelDirty = false, modelSaving = false, modelCatalogRequested = false, modelCatalogLoading = false, modelCatalogRevision = 0;
 const draftLabel = draft => draft.status === 'running' ? 'Генерируется' : 'Не завершён';
 function rememberReport(value) { reportSelection = value; sessionStorage.setItem('review-report-selection', value); }
 
@@ -70,9 +71,53 @@ function modal(title, content, actions = []) {
 }
 $('#dialog-close').onclick = () => $('#dialog').close();
 function empty(title, text) { const box = el('div', 'empty'); box.append(el('div', 'empty-icon', '◫'), el('h2', '', title), el('p', '', text)); return box; }
-function logout() { token = ''; sessionStorage.removeItem('review-token'); streamController?.abort(); $('#workspace').hidden = true; $('#login').hidden = false; }
+function logout() { token = ''; sessionStorage.removeItem('review-token'); streamController?.abort(); modelCatalogRevision++; modelCatalogRequested = false; modelCatalogLoading = false; modelDirty = false; $('#model-options').replaceChildren(); $('#workspace').hidden = true; $('#login').hidden = false; }
 $('#logout').onclick = logout;
 $('#login-form').onsubmit = async event => { event.preventDefault(); token = $('#token').value.trim(); try { await load(true); sessionStorage.setItem('review-token', token); $('#token').value = ''; connect(); } catch (e) { $('#login-error').textContent = e.message; } };
+
+function renderModelSettings() {
+  if (!state) return;
+  if (!modelDirty) $('#model-input').value = state.llm_model || '';
+  $('#model-current').textContent = state.llm_configured
+    ? `Сейчас: ${state.llm_model || 'модель не выбрана'}. Выбор применяется к новым отчётам и вопросам.`
+    : 'Настройте OPENAI_API_KEY и OPENAI_BASE_URL на сервере.';
+  $('#model-input').disabled = modelSaving || !state.llm_configured;
+  $('#model-apply').disabled = modelSaving || !state.llm_configured || !$('#model-input').value.trim();
+  $('#model-reset').disabled = modelSaving || !state.llm_configured;
+  $('#model-reset').title = state.llm_default_model ? `REVIEW_MODEL: ${state.llm_default_model}` : 'REVIEW_MODEL не задана';
+  $('#model-refresh').disabled = modelCatalogLoading || !state.llm_configured;
+  $('#generate').disabled = modelSaving || !state.llm_available || state.jobs.some(j => j.kind === 'report' && ['queued', 'running'].includes(j.status));
+  $('#generate').title = state.llm_available ? '' : 'Настройте OPENAI_API_KEY и выберите модель';
+  $('#chat-form button[type="submit"]').disabled = modelSaving || !state.llm_available;
+}
+async function refreshModels() {
+  const revision = ++modelCatalogRevision;
+  modelCatalogRequested = true; modelCatalogLoading = true;
+  $('#model-list-status').textContent = 'Загружаем список моделей…'; renderModelSettings();
+  try {
+    const data = await api('/models');
+    if (revision !== modelCatalogRevision) return;
+    $('#model-options').replaceChildren(...data.models.map(id => { const option = el('option'); option.value = id; return option; }));
+    $('#model-list-status').textContent = data.models.length ? '' : 'Список пуст. Введите ID модели вручную.';
+  } catch (error) {
+    if (revision === modelCatalogRevision) $('#model-list-status').textContent = error.message;
+  } finally {
+    if (revision === modelCatalogRevision) { modelCatalogLoading = false; renderModelSettings(); }
+  }
+}
+async function saveModel(model) {
+  if (modelSaving) return;
+  modelSaving = true; renderModelSettings();
+  try {
+    const result = await api('/model', 'PUT', {model});
+    state.llm_model = result.model; modelDirty = false;
+    await load();
+  } finally { modelSaving = false; renderModelSettings(); }
+}
+$('#model-input').oninput = () => { modelDirty = true; renderModelSettings(); };
+$('#model-form').onsubmit = event => { event.preventDefault(); guard(() => saveModel($('#model-input').value.trim())); };
+$('#model-reset').onclick = () => guard(() => saveModel(null));
+$('#model-refresh').onclick = () => refreshModels();
 
 async function load(adopt = false) {
   const revision = ++loadRevision;
@@ -96,8 +141,8 @@ async function load(adopt = false) {
   $('#review-count').textContent = String(state.report?.items.length || 0);
   $('#change-count').textContent = String(new Set(state.snapshot.fragments.map(f => f.path)).size);
   $('#generate').textContent = state.report ? 'Обновить отчёт ↗' : 'Создать отчёт ↗';
-  $('#generate').disabled = !state.llm_available || state.jobs.some(j => j.kind === 'report' && ['queued', 'running'].includes(j.status));
-  $('#generate').title = state.llm_available ? '' : 'Настройте OPENAI_API_KEY и REVIEW_MODEL';
+  renderModelSettings();
+  if (state.llm_configured && !modelCatalogRequested) void refreshModels();
   renderBanner(); renderJobs(); render(Boolean(displayedReport?.is_draft));
 }
 function renderBanner() {
@@ -112,7 +157,7 @@ function renderBanner() {
 function renderJobs() {
   const running = state.jobs.filter(j => ['queued', 'running'].includes(j.status));
   const node = $('#job-status'); node.replaceChildren(); node.hidden = !running.length;
-  for (const job of running) node.append(el('span', '', job.kind === 'report' ? 'Готовим отчёт…' : 'Готовим ответ…'), button('Отменить', 'quiet', () => api('/jobs/' + job.id + '/cancel', 'POST')));
+  for (const job of running) node.append(el('span', '', (job.kind === 'report' ? 'Готовим отчёт…' : 'Готовим ответ…') + (job.model ? ` · ${job.model}` : '')), button('Отменить', 'quiet', () => api('/jobs/' + job.id + '/cancel', 'POST')));
 }
 function updateNav() { $$('.nav-button').forEach(b => b.classList.toggle('active', b.dataset.view === view)); }
 $$('.nav-button').forEach(b => b.onclick = () => guard(async () => { view = b.dataset.view; updateNav(); await load(true); if (view === 'sources') await refreshSources(); }));
@@ -172,7 +217,7 @@ function renderOverview(container) {
   }
   const filter = el('label', 'checkbox-label'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = onlyProblems; checkbox.onchange = () => { onlyProblems = checkbox.checked; render(); }; filter.append(checkbox, document.createTextNode('Только пункты с проблемами')); toolbar.append(filter); container.append(toolbar);
   if (!displayedReport) {
-    container.append(empty('Сначала — общая картина', state.llm_available ? 'Подключите сессии во вкладке «Источники» и создайте отчёт. Изменения уже доступны для просмотра и stage.' : 'Diff и Git-действия уже доступны. Для объяснений и вопросов настройте OPENAI_API_KEY, OPENAI_BASE_URL и REVIEW_MODEL.'));
+    container.append(empty('Сначала — общая картина', state.llm_available ? 'Подключите сессии во вкладке «Источники» и создайте отчёт. Изменения уже доступны для просмотра и stage.' : 'Diff и Git-действия уже доступны. Для объяснений и вопросов настройте подключение LLM и выберите модель выше.'));
     const heading = el('div', 'section-heading'); heading.append(el('h2', '', 'Изменения в рабочем дереве'), button('Смотреть diff →', 'text-button', async () => { view = 'changes'; updateNav(); await load(true); })); container.append(heading);
     displayed.fragments.slice(0, 3).forEach(f => container.append(fragmentView(f)));
     return;
@@ -185,6 +230,7 @@ function renderOverview(container) {
     container.append(notice);
   }
   const summary = el('section', 'panel'); summary.dataset.liveKey = 'summary'; const body = el('div', 'panel-body'); const title = el('div', 'panel-title'); title.append(el('h2', '', 'Что изменилось'), tag(displayedReport.retrospective ? 'Ретроспективный отчёт' : 'С начала работы')); body.append(title, el('p', 'summary-text', displayedReport.summary || 'Ожидаем текст от модели…'));
+  if (displayedReport.model) body.append(el('p', 'footer-note report-model', 'Модель: ' + displayedReport.model));
   if (displayedReport.evidence_incomplete) body.append(el('p', 'footer-note', 'Часть истории не вошла в контекст LLM. Выводы ограничены доступными источниками.'));
   summary.append(body); container.append(summary);
   if (displayedReport.preexisting_paths?.length) container.append(el('p', 'preexisting', `До начала review уже были изменения: ${displayedReport.preexisting_paths.join(', ')}`));
@@ -322,7 +368,7 @@ async function loadMessages() {
   const data = await api('/messages?thread=' + encodeURIComponent(thread));
   const box = $('#chat-messages'); box.replaceChildren();
   if (!data.messages.length) box.append(el('p', 'footer-note', 'Спросите о причинах решения, граничных случаях или последствиях отмены фрагмента.'));
-  data.messages.forEach(message => { const node = el('div', 'message ' + message.role); node.append(el('span', 'role', message.role === 'user' ? 'ВЫ' : 'REVIEW ASSISTANT')); const text = el('span', '', message.content + (message.complete === false ? '\n[Ответ не завершён]' : '')); node.append(text); box.append(node); });
+  data.messages.forEach(message => { const node = el('div', 'message ' + message.role); node.append(el('span', 'role', message.role === 'user' ? 'ВЫ' : 'REVIEW ASSISTANT' + (message.model ? ` · ${message.model}` : ''))); const text = el('span', '', message.content + (message.complete === false ? '\n[Ответ не завершён]' : '')); node.append(text); box.append(node); });
   box.scrollTop = box.scrollHeight;
 }
 $('#chat-toggle').onclick = () => guard(() => openChat());
@@ -335,6 +381,7 @@ $('#chat-form').onsubmit = event => { event.preventDefault(); guard(async () => 
 
 async function receive(event) {
   if (event.type === 'connected') { $('#connection').textContent = 'Подключено'; await load(); return; }
+  if (event.type === 'model_changed') { await load(); return; }
   if (event.type === 'report_preview') {
     const draft = event.draft;
     const known = state.report_drafts.find(d => d.id === draft.id);
@@ -370,7 +417,7 @@ async function receive(event) {
   if (event.type === 'resync') { await load(); if (chatSnapshot) await loadMessages(); }
   if (event.type === 'chat_delta' && event.thread === chatSnapshot + ':' + (chatItem?.id || 'all')) {
     let text = liveMessages.get(event.message_id);
-    if (!text) { const node = el('div', 'message assistant'); node.append(el('span', 'role', 'REVIEW ASSISTANT')); text = el('span'); node.append(text); $('#chat-messages').append(node); liveMessages.set(event.message_id, text); }
+    if (!text) { const node = el('div', 'message assistant'); node.append(el('span', 'role', 'REVIEW ASSISTANT' + (event.model ? ` · ${event.model}` : ''))); text = el('span'); node.append(text); $('#chat-messages').append(node); liveMessages.set(event.message_id, text); }
     text.textContent += event.delta; $('#chat-messages').scrollTop = $('#chat-messages').scrollHeight;
   }
 }

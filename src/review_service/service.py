@@ -20,6 +20,7 @@ class Service:
         self.tasks = {}
         self.source_status = {}
         self.sync_lock = asyncio.Lock()
+        self.model_lock = asyncio.Lock()
         self.active_report = None
         self.stopping = False
 
@@ -46,6 +47,7 @@ class Service:
         return self.current
 
     async def initialize(self):
+        self.llm.model_override = await self.store.setting(self.model_setting_key)
         self.git.selected_untracked = set(await self.store.setting("untracked", []))
         await self.refresh()
         if not await self.store.setting("baseline"):
@@ -97,6 +99,8 @@ class Service:
             report_stale=bool(latest and latest["snapshot_version"] != self.current.version),
             report_sources_stale=bool(latest and latest.get("evidence_version") != self.evidence_version(await self.events())),
             llm_available=self.llm.available, source_status=self.source_status,
+            llm_model=self.llm.model, llm_default_model=self.config.model,
+            llm_configured=bool(self.config.api_key),
             report_drafts=[{k: d[k] for k in ("id", "created_at", "snapshot_id", "status", "revision")}
                            for d in await self.store.list("report_draft") if d["status"] != "completed"],
             active_report_draft_id=self.active_report,
@@ -104,6 +108,21 @@ class Service:
             jobs=await self.store.list("job"),
             operations=[{k: v for k, v in op.items() if k not in ("desired_index",)} for op in await self.store.list("operation")],
         )
+
+    @property
+    def model_setting_key(self):
+        return "llm_model:" + digest(self.config.base_url.rstrip("/").encode())
+
+    async def select_model(self, model):
+        if model is not None:
+            if not isinstance(model, str) or not model.strip() or len(model) > 1024:
+                raise ReviewError("Укажите непустой ID модели длиной до 1024 символов.")
+            model = model.strip()
+        async with self.model_lock:
+            await self.store.set_setting(self.model_setting_key, model)
+            self.llm.model_override = model
+            await self.emit("model_changed")
+            return {"model": self.llm.model}
 
     @staticmethod
     async def public_snapshot(snapshot):
@@ -241,6 +260,8 @@ class Service:
         if kind == "report":
             self.active_report = id
         job = dict(id=id, kind=kind, status="queued", created_at=now())
+        if kind in ("report", "chat"):
+            job["model"] = self.llm.model
         try:
             await self.store.put("job", id, job)
         except BaseException:
@@ -280,9 +301,10 @@ class Service:
         await self.emit("report_preview", job_id=draft["id"], revision=draft["revision"],
                         draft=json.loads(json.dumps(draft)))
 
-    async def generate(self, job_id):
+    async def generate(self, job_id, *, model=None):
+        model = self.llm.model if model is None else model
         try:
-            result = await self._generate(job_id)
+            result = await self._generate(job_id, model=model)
             draft = await self.store.get("report_draft", job_id)
             draft.update(status="completed", report_id=result["report_id"])
             await self.save_draft(draft)
@@ -305,7 +327,7 @@ class Service:
                 await self.save_draft(draft)
             raise
 
-    async def _generate(self, job_id):
+    async def _generate(self, job_id, *, model):
         async with self.git.lock:
             snapshot = await self.refresh()
         fragments = await asyncio.to_thread(diff_fragments, snapshot)
@@ -316,6 +338,7 @@ class Service:
         scope = dict(preexisting_paths=preexisting, retrospective=await self.store.setting("retrospective", True),
                      note="Preexisting changes are not automatically attributable to the agent. Missing historical rationale must be marked as unknown or reconstructed.")
         draft = dict(id=job_id, report_id=uid(), is_draft=True, created_at=now(), revision=0,
+                     model=model,
                      status="running", snapshot_id=snapshot.id, snapshot_version=snapshot.version,
                      baseline_id=baseline.id if baseline else None, preexisting_paths=preexisting,
                      retrospective=scope["retrospective"], evidence_version=self.evidence_version(events),
@@ -330,7 +353,7 @@ class Service:
             draft.update(data)
             await self.save_draft(draft)
 
-        generated, details = await self.llm.report(fragments, events, progress, scope=scope, on_preview=on_preview)
+        generated, details = await self.llm.report(fragments, events, progress, scope=scope, on_preview=on_preview, model=model)
         covered = {fid for item in generated.items for fid in item.fragment_ids}
         missing = [f for f in fragments if f["id"] not in covered]
         for file_layer, group in self.group_fragments(missing).items():
@@ -349,6 +372,7 @@ class Service:
             item.id = uid()
             item.reviewed = self.item_signature(item.model_dump()) in reviewed
         report = dict(id=draft["report_id"], created_at=now(), snapshot_id=snapshot.id, snapshot_version=snapshot.version,
+                      model=model,
                       baseline_id=baseline.id if baseline else None,
                       preexisting_paths=preexisting, retrospective=scope["retrospective"],
                       evidence_version=self.evidence_version(events),
@@ -372,7 +396,8 @@ class Service:
             result[f"{fragment['path']} · {fragment['layer']}"].append(fragment)
         return result
 
-    async def chat(self, job_id, question, snapshot_id, report_id, item_id):
+    async def chat(self, job_id, question, snapshot_id, report_id, item_id, *, model=None):
+        model = self.llm.model if model is None else model
         snapshot = await self.store.snapshot(snapshot_id)
         if not snapshot:
             raise ReviewError("Snapshot not found", 404)
@@ -394,12 +419,12 @@ class Service:
         history = [m for m in await self.store.list("message") if m["thread"] == thread and m.get("complete", True)]
         user = dict(id=uid(), thread=thread, role="user", content=question, created_at=now(), snapshot_id=snapshot_id)
         await self.store.put("message", user["id"], user)
-        message = dict(id=uid(), thread=thread, role="assistant", content="", created_at=now(), snapshot_id=snapshot_id, complete=False)
+        message = dict(id=uid(), thread=thread, role="assistant", content="", created_at=now(), snapshot_id=snapshot_id, complete=False, model=model)
         await self.store.put("message", message["id"], message)
         try:
-            async for delta in self.llm.answer(question, fragments, events, history, item):
+            async for delta in self.llm.answer(question, fragments, events, history, item, model=model):
                 message["content"] += delta
-                await self.emit("chat_delta", job_id=job_id, message_id=message["id"], delta=delta, thread=thread)
+                await self.emit("chat_delta", job_id=job_id, message_id=message["id"], delta=delta, thread=thread, model=model)
             message["complete"] = True
         finally:
             await self.store.put("message", message["id"], message)

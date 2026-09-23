@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from .config import Config
 from .models import GeneratedReport, ReviewError
+from .report_schema import report_schema, validation_detail
 from .report_stream import preview, report_json, validate_references
 
 
@@ -22,21 +23,26 @@ tests do not prove universal correctness. Flag bugs and suggest fixes, never hid
 Use only the supplied source_ids and fragment_ids. Do not invent sources or test results.
 If evidence is absent, say so. Dependencies are fragment IDs from this input.
 Return ONLY a JSON object matching this schema, with summary first, then items and findings:
-""" + json.dumps(GeneratedReport.model_json_schema(), ensure_ascii=False)
+"""
 
 
 class LLM:
     def __init__(self, config: Config):
         self.config = config
         self.client = None
+        self.model_override = None
         self.semaphore = asyncio.Semaphore(2)
 
     @property
+    def model(self):
+        return self.model_override if self.model_override is not None else self.config.model
+
+    @property
     def available(self):
-        return bool(self.config.model and self.config.api_key)
+        return bool(self.model and self.config.api_key)
 
     async def open(self):
-        if self.available:
+        if self.config.api_key:
             http = (DefaultAsyncHttpxClient(proxy=self.config.llm_proxy, trust_env=False)
                     if self.config.llm_proxy else DefaultAioHttpClient())
             try:
@@ -52,6 +58,20 @@ class LLM:
     async def close(self):
         if self.client:
             await self.client.close()
+
+    async def models(self):
+        if not self.client:
+            raise ReviewError("Настройте OPENAI_API_KEY и OPENAI_BASE_URL для выбора модели.", 503)
+        try:
+            async with asyncio.timeout(10):
+                page = await self.client.with_options(timeout=10, max_retries=0).models.list()
+                return sorted({entry.id async for entry in page if isinstance(entry.id, str) and entry.id.strip()})
+        except (APITimeoutError, TimeoutError) as exc:
+            raise ReviewError("Не удалось загрузить список моделей за 10 с. Введите ID вручную.", 504) from exc
+        except APIStatusError as exc:
+            raise self.provider_error(exc, model="", operation="список моделей") from exc
+        except Exception as exc:
+            raise ReviewError("Не удалось загрузить список моделей. Проверьте подключение или введите ID вручную.", 502) from exc
 
     def evidence(self, events: list[dict], budget: int):
         selected, size = [], 0
@@ -95,7 +115,7 @@ class LLM:
         text = re.sub(r"(?i)\b((?:https?|socks5h?)://)[^/\s@]+@", r"\1[скрыто]@", text)
         return " ".join(text.split())[:500]
 
-    def provider_error(self, exc: APIStatusError) -> ReviewError:
+    def provider_error(self, exc: APIStatusError, *, model: str, structured=False, operation=None) -> ReviewError:
         status = exc.status_code
         hint = {
             400: "Проверьте параметры запроса и размер контекста.",
@@ -112,15 +132,21 @@ class LLM:
             body = body.get("error", body)
         detail = body.get("message", "") if isinstance(body, dict) else body
         detail = self.safe_provider_text(detail) if isinstance(detail, str) else ""
-        model = self.safe_provider_text(self.config.model)
-        message = f"Провайдер LLM вернул HTTP {status} (модель: {model}). {hint}"
+        context = operation or "модель: " + self.safe_provider_text(model)
+        message = f"Провайдер LLM вернул HTTP {status} ({context}). {hint}"
+        if structured and status in (400, 422):
+            message += " Если сервер не поддерживает JSON Schema, задайте REVIEW_LLM_STRUCTURED_OUTPUT=0 и перезапустите сервис."
         if detail:
             message += f" Причина: {detail}"
+        if operation:
+            return ReviewError(message + " Можно ввести ID модели вручную.", 502)
         return ReviewError(message + " Черновик и предыдущий отчёт сохранены.", 502)
 
-    async def report(self, fragments: list[dict], events: list[dict], progress, scope=None, on_preview=None):
-        if not self.client:
-            raise ReviewError("Configure OPENAI_API_KEY and REVIEW_MODEL to generate explanations", 503)
+    async def report(self, fragments: list[dict], events: list[dict], progress, scope=None, on_preview=None, *, model=None):
+        model = self.model if model is None else model
+        structured = self.config.llm_structured_output
+        if not self.client or not model:
+            raise ReviewError("Настройте OPENAI_API_KEY и выберите модель для отчёта.", 503)
         sources, truncated = self.evidence(events, self.config.max_context_chars // 3)
         source_ids = {s["source_id"] for s in sources}
         batches, batch, length = [], [], 0
@@ -145,11 +171,16 @@ class LLM:
                 f"(лимит ожидания {self.config.llm_timeout_seconds:g} с)"
             )
             payload = dict(fragments=batch, sources=sources, evidence_incomplete=truncated, scope=scope)
-            messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+            valid_fragments = {f["id"] for f in batch}
+            schema = report_schema(source_ids, valid_fragments)
+            messages = [{"role": "system", "content": SYSTEM + json.dumps(schema, ensure_ascii=False)},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+            options = {"response_format": {"type": "json_schema", "json_schema": {
+                "name": "review_report", "strict": True, "schema": schema,
+            }}} if structured else {}
             async with self.semaphore:
                 for attempt in range(2):
                     text = ""
-                    valid_fragments = {f["id"] for f in batch}
                     last_preview = None
 
                     async def publish():
@@ -179,8 +210,8 @@ class LLM:
                     try:
                         async with asyncio.timeout(self.config.llm_timeout_seconds):
                             stream = await self.client.chat.completions.create(
-                                model=self.config.model, messages=messages, stream=True,
-                                max_tokens=self.config.max_output_tokens,
+                                model=model, messages=messages, stream=True,
+                                max_tokens=self.config.max_output_tokens, **options,
                             )
                             async with stream:
                                 async for chunk in stream:
@@ -191,7 +222,7 @@ class LLM:
                     except (APITimeoutError, TimeoutError) as exc:
                         raise self.timeout_error() from exc
                     except APIStatusError as exc:
-                        raise self.provider_error(exc) from exc
+                        raise self.provider_error(exc, model=model, structured=structured) from exc
                     except Exception as exc:
                         raise self.connection_error() from exc
                     finally:
@@ -207,26 +238,31 @@ class LLM:
                             else ": поток прерван или ответ отклонён.") + " Черновик сохранён.", 502)
                     try:
                         report = GeneratedReport.model_validate_json(report_json(text))
-                        for item in [*report.items, *report.findings]:
-                            validate_references(item, source_ids, valid_fragments)
                         for kind in ("items", "findings"):
                             for index, item in enumerate(getattr(report, kind)):
+                                validate_references(item, source_ids, valid_fragments, f"{kind}.{index}")
                                 item.id = f"{number}:{attempt}:{kind}:{index}"
                         reports.append(report)
                         break
                     except (ValidationError, ValueError) as exc:
+                        detail = self.safe_provider_text(validation_detail(exc))
                         if attempt:
-                            raise ReviewError("LLM returned an invalid report or invented references; previous report preserved", 502) from exc
+                            raise ReviewError(
+                                f"Не удалось проверить отчёт (модель: {self.safe_provider_text(model)}, "
+                                f"порция {number + 1}/{len(batches)}) после исправления. {detail} "
+                                "Черновик и предыдущий отчёт сохранены.", 502,
+                            ) from exc
                         messages.append({"role": "assistant", "content": text})
-                        messages.append({"role": "user", "content": "Repair the JSON schema and references using only IDs from the input. " + str(exc)[:1000]})
+                        messages.append({"role": "user", "content": "Repair the JSON schema and references using only IDs from the input. " + detail})
         return GeneratedReport(
             summary="\n\n".join(r.summary for r in reports) or "Нет фрагментов, доступных для анализа.",
             items=[i for r in reports for i in r.items], findings=[f for r in reports for f in r.findings],
         ), dict(evidence_incomplete=truncated, omitted_fragment_ids=oversized)
 
-    async def answer(self, question: str, fragments: list[dict], events: list[dict], history: list[dict], item: dict | None):
-        if not self.client:
-            raise ReviewError("Configure OPENAI_API_KEY and REVIEW_MODEL to ask questions", 503)
+    async def answer(self, question: str, fragments: list[dict], events: list[dict], history: list[dict], item: dict | None, *, model=None):
+        model = self.model if model is None else model
+        if not self.client or not model:
+            raise ReviewError("Настройте OPENAI_API_KEY и выберите модель для вопросов.", 503)
         sources, truncated = self.evidence(events, self.config.max_context_chars // 3)
         context = json.dumps(dict(item=item, fragments=fragments, sources=sources, evidence_incomplete=truncated), ensure_ascii=False)
         if len(context) > self.config.max_context_chars:
@@ -249,7 +285,7 @@ class LLM:
         async with self.semaphore:
             try:
                 stream = await self.client.chat.completions.create(
-                    model=self.config.model, messages=messages, stream=True,
+                    model=model, messages=messages, stream=True,
                     max_tokens=self.config.max_output_tokens,
                 )
                 async with stream:
@@ -259,6 +295,6 @@ class LLM:
             except (APITimeoutError, TimeoutError) as exc:
                 raise self.timeout_error() from exc
             except APIStatusError as exc:
-                raise self.provider_error(exc) from exc
+                raise self.provider_error(exc, model=model) from exc
             except Exception as exc:
                 raise self.connection_error() from exc
