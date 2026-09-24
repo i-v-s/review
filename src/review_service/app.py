@@ -13,7 +13,7 @@ from aiohttp import web
 from pydantic import ValidationError
 
 from .config import Config
-from .git import GitRepo
+from .git import GitRepo, comparison_map
 from .llm import LLM
 from .models import FileEditRequest, OperationRequest, ReviewError, SourceEvent, now, uid
 from .service import Service
@@ -200,11 +200,22 @@ async def file_content(request):
                                   omitted=bool(v.omitted_hash), unsupported=file.unsupported))
 
 
+async def file_comparison(request):
+    s = await request.app[SERVICE].store.snapshot(request.match_info["id"])
+    if not s:
+        raise ReviewError("Snapshot not found", 404)
+    file = next((f for f in s.files if f.path == request.query.get("path")), None)
+    if not file or file.unsupported:
+        raise ReviewError(file.unsupported if file else "File version not found", 404)
+    return web.json_response(comparison_map(file))
+
+
 async def report_get(request):
-    report = await request.app[SERVICE].store.get("report", request.match_info["id"])
+    service = request.app[SERVICE]
+    report = await service.store.get("report", request.match_info["id"])
     if not report:
         raise ReviewError("Report not found", 404)
-    return web.json_response(report)
+    return web.json_response(await service.public_report(report))
 
 
 async def draft_get(request):
@@ -377,6 +388,7 @@ def create_app(config: Config) -> web.Application:
         web.post("/api/v1/sync", sync), web.post("/api/v1/reviews", review_start),
         web.post("/api/v1/untracked", untracked),
         web.get("/api/v1/snapshots/{id}", snapshot), web.get("/api/v1/snapshots/{id}/file", file_content),
+        web.get("/api/v1/snapshots/{id}/comparison", file_comparison),
         web.get("/api/v1/reports/{id}", report_get), web.post("/api/v1/reports", report_generate),
         web.get("/api/v1/report-drafts/{id}", draft_get),
         web.patch("/api/v1/reports/{id}/items/{item}", review_mark),

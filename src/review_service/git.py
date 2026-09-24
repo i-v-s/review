@@ -82,6 +82,55 @@ def diff_fragments(snapshot: Snapshot) -> list[dict]:
     return result
 
 
+def comparison_map(file: FileState) -> dict:
+    """Project canonical layer line IDs onto a HEAD-to-work editor."""
+    def projection(source: FileVersion, target: FileVersion) -> dict[int, int]:
+        a, b = source.bytes().splitlines(keepends=True), target.bytes().splitlines(keepends=True)
+        mapped = {}
+        for tag, i, j, k, l in difflib.SequenceMatcher(a=a, b=b).get_opcodes():
+            if tag == "equal":
+                mapped.update((i + offset + 1, k + offset + 1) for offset in range(j - i))
+            elif tag == "replace" and k < l:
+                mapped.update((line + 1, min(k + line - i, l - 1) + 1) for line in range(i, j))
+        return mapped
+
+    index_to_head = projection(file.index, file.head)
+    index_to_work = projection(file.index, file.work)
+    result = {action: {side: {} for side in ("a", "b")} for action in ("stage", "unstage")}
+
+    def companions(old: FileVersion, new: FileVersion) -> dict[str, list[str]]:
+        paired = {}
+        for tag, i, j, k, l in difflib.SequenceMatcher(
+                a=old.bytes().splitlines(keepends=True), b=new.bytes().splitlines(keepends=True)).get_opcodes():
+            if tag != "replace":
+                continue
+            for offset in range(max(j - i, l - k)):
+                ids = ([f"d:{i + offset}"] if i + offset < j else []) + (
+                    [f"a:{k + offset}"] if k + offset < l else [])
+                for id in ids:
+                    paired[id] = ids
+        return paired
+
+    stage_pairs = companions(file.index, file.work)
+    unstage_pairs = companions(file.head, file.index)
+
+    def add(action, side, line, ids):
+        if line is not None:
+            result[action][side].setdefault(str(line), []).extend(ids)
+
+    for row in line_changes(file.index, file.work):
+        if row["id"]:
+            ids = stage_pairs.get(row["id"], [row["id"]])
+            add("stage", "a", index_to_head.get(row["old"]), ids)
+            add("stage", "b", row["new"], ids)
+    for row in line_changes(file.head, file.index):
+        if row["id"]:
+            ids = unstage_pairs.get(row["id"], [row["id"]])
+            add("unstage", "a", row["old"], ids)
+            add("unstage", "b", index_to_work.get(row["new"]), ids)
+    return result
+
+
 class GitRepo:
     def __init__(self, config: Config):
         self.config = config

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import ssl
 from pathlib import Path
 
@@ -11,11 +10,11 @@ import aiohttp
 from aiohttp import web
 
 from .app import create_app
-from .config import Config
+from .config import Config, settings_environment
 
 
 async def send_decision(args):
-    token = os.environ.get("REVIEW_TOKEN", "")
+    token = settings_environment().get("REVIEW_TOKEN", "")
     if args.token_file:
         token = Path(args.token_file).read_text().strip()
     if not token:

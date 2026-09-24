@@ -11,6 +11,7 @@ dependencies = [
   "aiohttp>=3.11,<4",
   "aiosqlite>=0.20,<1",
   "openai[aiohttp]>=1.76,<4",
+  "python-dotenv>=1,<2",
   "pydantic>=2.10,<3",
   "socksio>=1,<2",
 ]

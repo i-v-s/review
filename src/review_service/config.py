@@ -7,6 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from dotenv import dotenv_values
+
+
+def settings_environment() -> dict[str, str]:
+    """Read local settings without changing the process environment."""
+    file_values = dotenv_values(Path.cwd() / ".env")
+    return {key: value for key, value in file_values.items() if value is not None} | dict(os.environ)
+
 
 DEFAULT_FILE_FILTERS = {
     "tests": ["tests/*", "*/tests/*", "test_*.py", "*/test_*.py", "*_test.py", "*.test.*", "*.spec.*"],
@@ -83,22 +91,23 @@ class Config:
 
     @classmethod
     def from_env(cls, repo: Path, **overrides):
-        structured = os.environ.get("REVIEW_LLM_STRUCTURED_OUTPUT", "1")
+        env = settings_environment()
+        structured = env.get("REVIEW_LLM_STRUCTURED_OUTPUT", "1")
         if structured not in ("0", "1"):
             raise ValueError("REVIEW_LLM_STRUCTURED_OUTPUT: ожидается 0 или 1")
         values = dict(
-            api_key=os.environ.get("OPENAI_API_KEY", ""),
-            base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            model=os.environ.get("REVIEW_MODEL", ""),
-            token=os.environ.get("REVIEW_TOKEN"),
-            llm_timeout_seconds=float(os.environ.get("REVIEW_LLM_TIMEOUT_SECONDS", "600")),
-            llm_max_retries=int(os.environ.get("REVIEW_LLM_MAX_RETRIES", "0")),
+            api_key=env.get("OPENAI_API_KEY", ""),
+            base_url=env.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            model=env.get("REVIEW_MODEL", ""),
+            token=env.get("REVIEW_TOKEN"),
+            llm_timeout_seconds=float(env.get("REVIEW_LLM_TIMEOUT_SECONDS", "600")),
+            llm_max_retries=int(env.get("REVIEW_LLM_MAX_RETRIES", "0")),
             llm_structured_output=structured == "1",
-            llm_proxy=os.environ.get("REVIEW_LLM_PROXY", ""),
-            max_context_chars=int(os.environ.get("REVIEW_MAX_CONTEXT_CHARS", "100000")),
-            max_output_tokens=int(os.environ.get("REVIEW_MAX_OUTPUT_TOKENS", "8192")),
-            opencode_url=os.environ.get("OPENCODE_URL", ""),
-            opencode_username=os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"),
-            opencode_password=os.environ.get("OPENCODE_SERVER_PASSWORD", ""),
+            llm_proxy=env.get("REVIEW_LLM_PROXY", ""),
+            max_context_chars=int(env.get("REVIEW_MAX_CONTEXT_CHARS", "100000")),
+            max_output_tokens=int(env.get("REVIEW_MAX_OUTPUT_TOKENS", "8192")),
+            opencode_url=env.get("OPENCODE_URL", ""),
+            opencode_username=env.get("OPENCODE_SERVER_USERNAME", "opencode"),
+            opencode_password=env.get("OPENCODE_SERVER_PASSWORD", ""),
         )
         return cls(repo=repo, **(values | overrides))

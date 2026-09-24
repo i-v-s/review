@@ -114,6 +114,9 @@ class OperationRequest(Model):
     line_ids: list[str] = Field(default_factory=list, max_length=10000)
     whole_file: bool = False
     key: str = Field(min_length=8, max_length=128)
+    report_id: str | None = None
+    target_kind: Literal["summary", "item", "finding"] | None = None
+    target_id: str | None = None
 
 
 class FileEditRequest(Model):
@@ -122,6 +125,9 @@ class FileEditRequest(Model):
     path: str
     content: str
     key: str = Field(min_length=8, max_length=128)
+    report_id: str | None = None
+    target_kind: Literal["summary", "item", "finding"] | None = None
+    target_id: str | None = None
 
 
 class ReviewError(Exception):

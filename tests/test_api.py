@@ -54,6 +54,64 @@ async def test_edit_work_file_is_versioned_idempotent_and_undoable(client, servi
     assert (repo / 'example.py').read_text() == 'changed\n'
 
 
+async def test_report_operations_advance_working_snapshot_and_keep_original(client, service, repo):
+    (repo / 'example.py').write_text('changed\n')
+    original = await service.refresh()
+    from review_service.git import diff_fragments
+    fragment = diff_fragments(original)[0]
+    report = dict(id='report-with-journal', snapshot_id=original.id, snapshot_version=original.version,
+                  items=[dict(id='item-one', title='Change', fragment_ids=[fragment['id']])], findings=[])
+    await service.store.put('report', report['id'], report)
+    scope = dict(report_id=report['id'], target_kind='item', target_id='item-one')
+    stage = await client.post('/api/v1/operations', json=dict(
+        snapshot_id=original.id, expected_version=original.version, path='example.py',
+        action='stage', whole_file=True, key=uid(), **scope))
+    assert stage.status == 200
+    staged_op = await stage.json()
+    reported = await (await client.get('/api/v1/reports/' + report['id'])).json()
+    assert reported['snapshot_id'] == original.id
+    assert reported['working_snapshot_id'] == staged_op['after_id']
+    assert [entry['id'] for entry in reported['journal']] == [staged_op['id']]
+    assert reported['journal'][0]['target_id'] == 'item-one'
+
+    edit = await client.post('/api/v1/operations/edit', json=dict(
+        snapshot_id=staged_op['after_id'], expected_version=staged_op['after_version'],
+        path='example.py', content='edited\n', key=uid(), **scope))
+    assert edit.status == 200
+    edit_op = await edit.json()
+    reported = await (await client.get('/api/v1/reports/' + report['id'])).json()
+    assert reported['working_snapshot_id'] == edit_op['after_id']
+    assert len(reported['journal']) == 2
+    undo = await client.post('/api/v1/operations/' + edit_op['id'] + '/undo', json={'key': uid()})
+    assert undo.status == 200
+    undo_op = await undo.json()
+    reported = await (await client.get('/api/v1/reports/' + report['id'])).json()
+    assert reported['working_snapshot_id'] == undo_op['after_id']
+    assert reported['journal'][-1]['undo_of'] == edit_op['id']
+    assert (repo / 'example.py').read_text() == 'changed\n'
+    await service.store.put('report_live', report['id'],
+                            {'snapshot_id': original.id, 'snapshot_version': original.version})
+    await service.rebuild_report_live()
+    restored = await (await client.get('/api/v1/reports/' + report['id'])).json()
+    assert restored['working_snapshot_id'] == undo_op['after_id']
+
+
+async def test_head_to_work_comparison_maps_both_layers(client, service, repo):
+    (repo / 'example.py').write_text('ONE\ntwo\nthree\nfour\n')
+    from conftest import git_command
+    git_command(repo, 'add', 'example.py')
+    (repo / 'example.py').write_text('ONE\nTWO\nthree\nfour\n')
+    snapshot = await service.refresh()
+    response = await client.get(f'/api/v1/snapshots/{snapshot.id}/comparison',
+                                params={'path': 'example.py'})
+    assert response.status == 200
+    mapping = await response.json()
+    assert 'a:0' in mapping['unstage']['b']['1']
+    assert 'a:1' in mapping['stage']['b']['2']
+    assert 'd:0' in mapping['unstage']['a']['1']
+    assert 'd:1' in mapping['stage']['a']['2']
+
+
 async def test_sync_captures_clean_file_for_current_editor(client, service, repo):
     state = await (await client.post('/api/v1/sync', json={'paths': ['example.py']})).json()
     file = await (await client.get(f"/api/v1/snapshots/{state['snapshot']['id']}/file",

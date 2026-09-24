@@ -90,6 +90,22 @@
 }
 @media(max-width:700px){.topbar{height:auto}.layout > .chat-panel{top:0;height:100dvh}}
 
+/* Review diff toolbar and staged provenance. */
+.overview-diff-header{display:flex;flex-wrap:nowrap;gap:8px;overflow:hidden;min-height:43px;padding:4px 10px}
+.overview-diff-header h2{flex:0 1 220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;overflow-wrap:normal}
+.overview-diff-actions{display:flex;flex:1 1 auto;min-width:0;align-items:center;justify-content:flex-start;gap:5px;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;padding:0;background:transparent;border:0;scrollbar-width:thin}
+.overview-diff-actions>*{flex:none;white-space:nowrap}
+.overview-diff-actions .checkbox-label{color:var(--ink);font-size:10px}
+.overview-diff-actions .checkbox-label input{margin:0;accent-color:var(--green)}
+.overview-item-journal{display:flex;flex-direction:column;gap:5px}
+.overview-journal-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px solid var(--line);font-size:11px}
+.overview-journal-row span{min-width:0;overflow-wrap:anywhere}
+.overview-journal-row button{flex:none}
+.overview-editor-host .cm-merge-a .cm-changedText,.overview-editor-host .cm-deletedChunk .cm-deletedText{background:#e8a79b!important;text-decoration:none!important}
+.overview-editor-host .cm-merge-b .cm-changedText{background:#a8d891!important;text-decoration:none!important}
+.overview-editor-host .cm-review-staged-line{background:#dce9f7!important;box-shadow:inset 3px 0 #4177aa}
+@media(max-width:800px){.overview-diff-header h2{flex:0 0 95px}.overview-editor-host .cm-mergeViewEditors{min-width:620px}}
+
 /* The workspace menu and report tree share one resizable sidebar. */
 #workspace{--sidebar-width:250px}
 .sidebar{position:sticky;top:var(--header-height);align-self:flex-start;flex:0 0 var(--sidebar-width);width:var(--sidebar-width);height:calc(100dvh - var(--header-height));padding:0;overflow:hidden;border-right:0}

@@ -71,6 +71,60 @@ class Service:
         for op in await self.store.list("operation"):
             if op["status"] == "prepared":
                 await self.recover(op)
+        await self.rebuild_report_live()
+
+    async def rebuild_report_live(self):
+        # Operation records are the durable journal; this projection can be rebuilt
+        # after a crash between the Git write and the report pointer update.
+        latest = {}
+        for op in await self.store.list("operation"):
+            if op.get("report_id") and op["status"] == "completed" and op.get("after_id"):
+                latest[op["report_id"]] = op
+        for report_id, op in latest.items():
+            await self.store.put("report_live", report_id,
+                                 {"snapshot_id": op["after_id"], "snapshot_version": op["after_version"]})
+
+    async def report_live(self, report):
+        return await self.store.get("report_live", report["id"]) or {
+            "snapshot_id": report["snapshot_id"], "snapshot_version": report["snapshot_version"]}
+
+    async def public_report(self, report):
+        if not report:
+            return None
+        live = await self.report_live(report)
+        journal = [op for op in await self.store.list("operation")
+                   if op.get("report_id") == report["id"]]
+        return {**report, "working_snapshot_id": live["snapshot_id"],
+                "working_snapshot_version": live["snapshot_version"], "journal": journal}
+
+    async def operation_context(self, req):
+        if not req.report_id:
+            if req.target_kind or req.target_id:
+                raise ReviewError("Report target requires a report")
+            return {}
+        report = await self.store.get("report", req.report_id)
+        if not report or req.target_kind not in ("summary", "item", "finding"):
+            raise ReviewError("Unknown report target")
+        if req.target_kind == "summary":
+            if req.target_id is not None:
+                raise ReviewError("Summary has no target ID")
+        else:
+            collection = report["items"] if req.target_kind == "item" else report.get("findings", [])
+            target = next((entry for entry in collection if entry["id"] == req.target_id), None)
+            if not target:
+                raise ReviewError("Unknown report target")
+            original = await self.store.snapshot(report["snapshot_id"])
+            paths = {f["path"] for f in diff_fragments(original)
+                     if f["id"] in target["fragment_ids"]}
+            if req.path not in paths:
+                raise ReviewError("File is not linked to the selected report item")
+        return {"report_id": req.report_id, "target_kind": req.target_kind,
+                "target_id": req.target_id, "journal_kind": "git"}
+
+    async def advance_report_live(self, op):
+        if op.get("report_id") and op.get("after_id"):
+            await self.store.put("report_live", op["report_id"],
+                                 {"snapshot_id": op["after_id"], "snapshot_version": op["after_version"]})
 
     async def recover(self, op):
         current = await self.git.capture({op["path"]})
@@ -90,6 +144,7 @@ class Service:
         reports = await self.store.list("report")
         baseline = await self.store.snapshot(await self.store.setting("baseline"))
         latest = reports[-1] if reports else None
+        latest_live = await self.report_live(latest) if latest else None
         return dict(
             repo=str(self.git.root), snapshot=await self.public_snapshot(self.current),
             file_filters=self.config.file_filters,
@@ -97,7 +152,7 @@ class Service:
             preexisting_paths=[f.path for f in baseline.files if f.dirty] if baseline else [],
             retrospective=await self.store.setting("retrospective", True),
             report=latest, reports=[dict(id=r["id"], created_at=r["created_at"], snapshot_id=r["snapshot_id"]) for r in reports],
-            report_stale=bool(latest and latest["snapshot_version"] != self.current.version),
+            report_stale=bool(latest_live and latest_live["snapshot_version"] != self.current.version),
             report_sources_stale=bool(latest and latest.get("evidence_version") != self.evidence_version(await self.events())),
             llm_available=self.llm.available, source_status=self.source_status,
             llm_model=self.llm.model, llm_default_model=self.config.model,
@@ -191,6 +246,7 @@ class Service:
                 if existing.get("request_hash") != request_hash:
                     raise ReviewError("Idempotency key already belongs to another operation", 409)
                 return existing
+            context = await self.operation_context(req)
             snapshot = await self.store.snapshot(req.snapshot_id)
             if not snapshot or snapshot.version != req.expected_version:
                 raise ReviewError("Unknown or stale snapshot", 409)
@@ -202,7 +258,7 @@ class Service:
                 return dict(path=file.path, exists=target.exists, content=target.bytes().decode("utf-8"),
                             changes_index=req.action != "discard")
             index, index_version = await self.git.build_index(snapshot, req.path, target) if req.action != "discard" else (None, snapshot.index_version)
-            op = dict(id=req.key, request_hash=request_hash, path=req.path, action=req.action,
+            op = dict(id=req.key, request_hash=request_hash, path=req.path, action=req.action, **context,
                       status="prepared", created_at=now(), before_id=snapshot.id, before_version=snapshot.version,
                       head=snapshot.head,
                       desired_index_hash=index_version,
@@ -219,6 +275,7 @@ class Service:
                     raise
                 op = recorded
             await self.store.put("operation", op["id"], op)
+            await self.advance_report_live(op)
             await self.emit("operation", operation=op)
             return op
 
@@ -234,6 +291,7 @@ class Service:
                 if existing.get("request_hash") != request_hash:
                     raise ReviewError("Idempotency key already belongs to another operation", 409)
                 return existing
+            context = await self.operation_context(req)
             snapshot = await self.store.snapshot(req.snapshot_id)
             if not snapshot or snapshot.version != req.expected_version:
                 raise ReviewError("Unknown or stale snapshot", 409)
@@ -245,7 +303,7 @@ class Service:
                 raise ReviewError("Этот файл нельзя редактировать в diff")
             target = FileVersion.of(data, file.work.mode)
             target.permissions = file.work.permissions
-            op = dict(id=req.key, request_hash=request_hash, path=req.path, action="edit", changes_work=True,
+            op = dict(id=req.key, request_hash=request_hash, path=req.path, action="edit", changes_work=True, **context,
                       status="prepared", created_at=now(), before_id=snapshot.id, before_version=snapshot.version,
                       head=snapshot.head, desired_index_hash=snapshot.index_version,
                       desired_work_hash=target.fingerprint())
@@ -261,6 +319,7 @@ class Service:
                     raise
                 op = recorded
             await self.store.put("operation", op["id"], op)
+            await self.advance_report_live(op)
             await self.emit("operation", operation=op)
             return op
 
@@ -283,7 +342,8 @@ class Service:
             changes_work = op["action"] == "discard" or op.get("changes_work", False)
             index = None if changes_work else base64.b64decode(before.index_content)
             target = old_file.work
-            undo = dict(id=key, undo_of=op_id, path=op["path"], action="undo", changes_work=changes_work,
+            context = {k: op[k] for k in ("report_id", "target_kind", "target_id", "journal_kind") if k in op}
+            undo = dict(id=key, undo_of=op_id, path=op["path"], action="undo", changes_work=changes_work, **context,
                         status="prepared", created_at=now(), before_id=current.id, before_version=current.version,
                         head=current.head,
                         desired_index_hash=before.index_version if index is not None else current.index_version,
@@ -293,6 +353,7 @@ class Service:
             after = await self.refresh({op["path"]})
             undo.update(status="completed", after_id=after.id, after_version=after.version)
             await self.store.put("operation", key, undo)
+            await self.advance_report_live(undo)
             await self.emit("operation", operation=undo)
             return undo
 

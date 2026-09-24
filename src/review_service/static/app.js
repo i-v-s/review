@@ -15,9 +15,11 @@ let loadRevision = 0;
 let modelDirty = false, modelSaving = false, modelCatalogRequested = false, modelCatalogLoading = false, modelCatalogRevision = 0;
 let modelCatalog = [], modelActiveIndex = -1;
 let overviewRoot, overviewRootKey = '', overviewTarget = {kind: 'summary', id: null};
-let overviewFile = null, overviewLayer = null, overviewMode = 'frozen', overviewEditor = null, overviewEditorKey = '';
+let overviewFile = null, overviewLayer = null, overviewMode = 'live', overviewWorking = null;
+let overviewShowStaged = false, overviewEditing = false, overviewComparison = null;
+let overviewEditor = null, overviewEditorKey = '';
 let overviewInitialContent = '', overviewUnsaved = false, overviewDiffRevision = 0;
-let overviewSelection = [], overviewLineIds = [], chatTargetKind = 'all', chatTargetId = null;
+let overviewSelection = [], overviewActionIds = {stage: [], unstage: []}, chatTargetKind = 'all', chatTargetId = null;
 let chatExpanded = false, uiRepo = '', overviewSplitRatio = .5, overviewResizeObserver, overviewEditorResizeObserver;
 let sidebarMode = 'workspace', sidebarContext = '', sidebarWidth = 250, sidebarPreferredWidth = 250;
 let showTests = false, showDocs = false, treeNodeNumber = 0;
@@ -285,8 +287,12 @@ async function load(adopt = false) {
     if (revision !== loadRevision) return;
     const snapshot = report && displayed.id !== report.snapshot_id ? await api('/snapshots/' + report.snapshot_id) : displayed;
     if (revision !== loadRevision) return;
+    const working = report && !report.is_draft && report.working_snapshot_id !== snapshot.id
+      ? await api('/snapshots/' + report.working_snapshot_id) : snapshot;
+    if (revision !== loadRevision) return;
     displayedReport = report;
     displayed = snapshot;
+    overviewWorking = working;
   }
   $('#snapshot-label').textContent = displayed.version.slice(0, 12);
   $('#review-count').textContent = String(state.report?.items.length || 0);
@@ -390,8 +396,8 @@ function overviewFiles(target) {
 }
 function overviewChoose(kind, id = null, file = null, layer = null) {
   if (overviewUnsaved && !confirm('В редакторе есть несохранённые изменения. Перейти без сохранения?')) return;
-  overviewTarget = {kind, id}; overviewSelection = []; overviewLineIds = [];
-  overviewFile = file; overviewLayer = layer; overviewMode = 'frozen';
+  overviewTarget = {kind, id}; overviewSelection = []; overviewActionIds = {stage: [], unstage: []};
+  overviewFile = file; overviewLayer = layer; overviewMode = 'live'; overviewEditing = false; overviewShowStaged = false;
   render(); updateChatSelections();
 }
 function overviewTreeButton(label, kind, id, file = null, layer = null, level = 0, badge = '') {
@@ -609,9 +615,11 @@ function renderOverviewTree(focusFilter = '') {
 function renderOverviewWorkspace(container) {
   const rootKey = `${reportSelection}:${displayed.id}`;
   if (!overviewRoot || overviewRootKey !== rootKey) {
+    overviewDiffRevision++;
     overviewResizeObserver?.disconnect(); overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; overviewEditorKey = ''; overviewRootKey = rootKey;
     overviewTarget = {kind: 'summary', id: null}; overviewFile = null; overviewLayer = null;
-    overviewMode = 'frozen'; overviewUnsaved = false; overviewSelection = [];
+    overviewMode = 'live'; overviewEditing = false; overviewShowStaged = false;
+    overviewUnsaved = false; overviewSelection = [];
     overviewRoot = el('div', 'overview-workspace');
     const grid = el('div', 'overview-grid');
     const center = el('div', 'overview-center');
@@ -668,7 +676,7 @@ function renderOverviewDetail() {
   pane.append(header);
   if (!report) { pane.append(empty('Отчёт ещё не создан', 'Создайте отчёт или выберите файл слева, чтобы изучить diff.')); return; }
   if (report.is_draft) pane.append(el('p', 'overview-notice draft-status', `${draftLabel(report)} · ${report.error || 'Предварительный текст. Отметки станут доступны после завершения.'}`));
-  if (!report.is_draft && displayed.version !== state.snapshot.version) pane.append(el('p', 'overview-notice', 'Отчёт относится к прежнему снимку. Текущий рабочий файл может отличаться.'));
+  if (!report.is_draft && overviewWorking?.version !== state.snapshot.version) pane.append(el('p', 'overview-notice', 'Отчёт относится к прежнему снимку. Текущий рабочий файл может отличаться.'));
   if (!report.is_draft && state.report_sources_stale) pane.append(el('p', 'overview-notice', 'Источники изменились после создания отчёта. Обновите отчёт для новых данных.'));
   if (overviewTarget.kind === 'summary') {
     overviewText(pane, '', 'summary', report.summary || 'Ожидаем текст от модели…');
@@ -686,54 +694,96 @@ function renderOverviewDetail() {
     }
     const links = el('div', 'sources-links'); target.source_ids?.forEach((id, i) => links.append(button(`Источник ${i + 1} ↗`, '', () => showSource(id)))); pane.append(links);
   }
+  if (!report.is_draft) {
+    const entries = (report.journal || []).filter(op => op.target_kind === overviewTarget.kind &&
+      (op.target_id || null) === (overviewTarget.id || null));
+    if (entries.length) {
+      pane.append(el('p', 'detail-label', 'Журнал пункта'));
+      const journal = el('div', 'overview-item-journal');
+      for (const op of [...entries].reverse()) {
+        const row = el('div', 'overview-journal-row');
+        row.append(el('span', '', `${op.action} · ${op.path} · ${new Date(op.created_at).toLocaleString('ru')}`));
+        const undo = button('Откатить ↶', 'text-button', async () => {
+          await api('/operations/' + op.id + '/undo', 'POST', {key: key()});
+          await load(); toast('Предыдущее состояние восстановлено');
+        });
+        undo.disabled = op.status !== 'completed' || op.after_version !== state.snapshot.version;
+        if (undo.disabled) undo.title = 'После операции изменилось состояние репозитория';
+        row.append(undo); journal.append(row);
+      }
+      pane.append(journal);
+    }
+  }
   const ask = button('Спросить об этом ↗', 'text-button overview-ask', () => openOverviewChat(true));
   ask.disabled = Boolean(report.is_draft); pane.append(ask);
 }
-function overviewChangedLines() {
-  return overviewFragmentsFor(overviewFile, overviewLayer, overviewMode === 'live' ? state.snapshot : displayed)
-    .flatMap(f => f.rows).filter(r => r.id);
+function overviewContext() {
+  return displayedReport && !displayedReport.is_draft ? {
+    report_id: displayedReport.id, target_kind: overviewTarget.kind, target_id: overviewTarget.id} : {};
 }
 function overviewSelectCode(selection) {
-  const snapshot = overviewMode === 'live' ? state.snapshot : displayed;
-  const side = selection.side === 'a' ? (overviewLayer === 'staged' ? 'head' : 'index') : (overviewLayer === 'staged' ? 'index' : 'work');
+  const snapshot = overviewMode === 'live' ? overviewWorking : displayed;
+  const side = selection.side === 'a' ? (overviewShowStaged ? 'head' : 'index') : 'work';
   overviewSelection = overviewSelection.filter(s => s.kind !== 'code' && s.kind !== 'unsaved');
   if (selection.unsaved) overviewSelection.push({kind: 'unsaved', path: overviewFile, text: selection.text.slice(0, 2000)});
   else overviewSelection.push({kind: 'code', snapshot_id: snapshot.id, path: overviewFile, side,
                                start: selection.start, end: selection.end});
-  const field = selection.side === 'a' ? 'old' : 'new';
-  overviewLineIds = overviewChangedLines().filter(r => r[field] >= selection.start && r[field] <= selection.end).map(r => r.id);
+  if (overviewShowStaged && overviewComparison) {
+    overviewActionIds = Object.fromEntries(['stage', 'unstage'].map(action => [action,
+      [...new Set(Array.from({length: selection.end - selection.start + 1}, (_, n) =>
+        overviewComparison[action][selection.side][String(selection.start + n)] || []).flat())]]));
+  } else {
+    const field = selection.side === 'a' ? 'old' : 'new';
+    overviewActionIds = {stage: overviewFragmentsFor(overviewFile, 'unstaged', snapshot)
+      .flatMap(f => f.rows).filter(r => r.id && r[field] >= selection.start && r[field] <= selection.end).map(r => r.id),
+      unstage: []};
+  }
   updateChatSelections();
-  const count = $('.overview-line-count', overviewRoot); if (count) count.textContent = `${overviewLineIds.length} строк diff`;
   overviewUpdateSave();
 }
 function overviewUpdateSave() {
   const save = $('.overview-save', overviewRoot); if (save) save.disabled = !overviewUnsaved;
-  const stage = $('.overview-stage-lines', overviewRoot); if (stage) stage.disabled = overviewMode !== 'live' || overviewUnsaved || !overviewLineIds.length;
-  const whole = $('.overview-stage-all', overviewRoot); if (whole) whole.disabled = overviewMode !== 'live' || overviewUnsaved;
+  const available = overviewMode === 'live' && !overviewUnsaved &&
+    overviewWorking?.version === state.snapshot.version && !displayedReport?.is_draft;
+  for (const action of ['stage', 'unstage']) {
+    const layer = action === 'stage' ? 'unstaged' : 'staged';
+    const present = overviewFragmentsFor(overviewFile, layer, overviewWorking).length > 0;
+    const lines = $(`.overview-${action}-lines`, overviewRoot);
+    const whole = $(`.overview-${action}-all`, overviewRoot);
+    if (lines) lines.disabled = !available || !present || !overviewActionIds[action].length;
+    if (whole) whole.disabled = !available || !present;
+  }
+  const count = $('.overview-line-count', overviewRoot);
+  if (count) count.textContent = overviewShowStaged
+    ? `${overviewActionIds.stage.length} к Stage · ${overviewActionIds.unstage.length} к Unstage`
+    : `${overviewActionIds.stage.length} строк diff`;
+  const toggle = $('.overview-staged-toggle', overviewRoot); if (toggle) toggle.disabled = overviewUnsaved;
 }
-async function overviewGitAction(whole) {
+async function overviewGitAction(action, whole) {
   if (overviewMode !== 'live' || overviewUnsaved) throw new Error('Сначала сохраните текущий файл.');
-  const fragment = overviewFragmentsFor(overviewFile, overviewLayer, state.snapshot)[0];
-  if (!fragment) throw new Error('Для файла нет изменений в выбранном слое.');
-  const action = overviewLayer === 'staged' ? 'unstage' : 'stage';
-  const op = await api('/operations', 'POST', {snapshot_id: state.snapshot.id, expected_version: state.snapshot.version,
-    path: overviewFile, action, line_ids: whole ? [] : overviewLineIds, whole_file: whole, key: key()});
+  const layer = action === 'stage' ? 'unstaged' : 'staged';
+  if (!overviewFragmentsFor(overviewFile, layer, overviewWorking).length) throw new Error('Для файла нет изменений в выбранном слое.');
+  const op = await api('/operations', 'POST', {snapshot_id: overviewWorking.id,
+    expected_version: overviewWorking.version, path: overviewFile, action,
+    line_ids: whole ? [] : overviewActionIds[action], whole_file: whole, key: key(), ...overviewContext()});
   if (op.status !== 'completed') throw new Error(op.error || 'Операция не завершена');
-  overviewLineIds = []; overviewSelection = overviewSelection.filter(s => s.kind === 'report');
+  overviewActionIds = {stage: [], unstage: []}; overviewSelection = overviewSelection.filter(s => s.kind === 'report');
   overviewEditorKey = ''; await load(); toast('Готово. Восстановление доступно в истории действий.');
 }
 async function overviewSave() {
   if (!overviewEditor || !overviewUnsaved || overviewMode !== 'live') return;
-  const op = await api('/operations/edit', 'POST', {snapshot_id: state.snapshot.id,
-    expected_version: state.snapshot.version, path: overviewFile, content: overviewEditor.content, key: key()});
+  const op = await api('/operations/edit', 'POST', {snapshot_id: overviewWorking.id,
+    expected_version: overviewWorking.version, path: overviewFile, content: overviewEditor.content,
+    key: key(), ...overviewContext()});
   if (op.status !== 'completed') throw new Error(op.error || 'Файл не сохранён');
   overviewUnsaved = false; overviewEditorKey = ''; overviewSelection = overviewSelection.filter(s => s.kind === 'report');
-  await load(); toast('Рабочий файл сохранён. Отчёт относится к прежнему снимку.');
+  await load(); toast('Рабочий файл сохранён. Откат доступен в журнале пункта.');
 }
 async function overviewEditCurrent() {
   if (!overviewFile) return;
-  state = await api('/sync', 'POST', {paths: [overviewFile]});
-  overviewMode = 'live'; overviewEditorKey = ''; overviewLineIds = [];
+  state = await api('/sync', 'POST', {paths: [overviewFile]}); overviewWorking = state.snapshot;
+  overviewMode = 'live'; overviewEditing = true; overviewShowStaged = false;
+  overviewEditorKey = ''; overviewActionIds = {stage: [], unstage: []};
   render();
 }
 function updateChatSelections() {
@@ -749,40 +799,73 @@ async function renderOverviewDiff() {
   const pane = $('.overview-diff', overviewRoot); if (!pane) return;
   const candidates = overviewFiles(overviewTargetObject());
   if (!overviewFile && candidates.length) { overviewFile = candidates[0].path; overviewLayer = candidates[0].layer; }
-  const snapshot = overviewMode === 'live' ? state.snapshot : displayed;
-  const editorKey = `${snapshot.id}:${overviewFile}:${overviewLayer}:${overviewMode}`;
+  const path = overviewFile;
+  const snapshot = overviewMode === 'live' ? overviewWorking : displayed;
+  const editorKey = `${snapshot.id}:${path}:${overviewMode}:${overviewShowStaged}:${overviewEditing}`;
   const header = el('div', 'overview-pane-header overview-diff-header');
-  header.append(el('h2', '', overviewFile || 'Diff файла'));
-  if (overviewFile) header.append(tag(overviewMode === 'frozen' ? 'Снимок отчёта' : 'Текущий файл', overviewMode === 'frozen' ? '' : 'warning'));
+  const title = el('h2', '', path || 'Diff файла'); title.title = path || '';
+  header.append(title);
   const actions = el('div', 'overview-diff-actions');
-  if (overviewFile) {
-    if (overviewMode === 'frozen') actions.append(button('Редактировать текущий файл ↗', 'outline', overviewEditCurrent));
-    else {
-      actions.append(button('Вернуться к снимку', 'quiet', () => { if (overviewUnsaved && !confirm('Сбросить несохранённые правки?')) return; overviewMode = 'frozen'; overviewUnsaved = false; overviewEditorKey = ''; render(); }));
-      actions.append(button('Сохранить файл', 'primary overview-save', overviewSave));
-      const action = overviewLayer === 'staged' ? 'Unstage' : 'Stage';
-      actions.append(button(`${action} строк`, 'outline overview-stage-lines', () => overviewGitAction(false)));
-      actions.append(button(`${action} файла`, 'outline overview-stage-all', () => overviewGitAction(true)));
-      actions.append(el('span', 'overview-line-count', `${overviewLineIds.length} строк diff`));
+  if (path) {
+    const staged = el('label', 'checkbox-label overview-staged-label');
+    const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'overview-staged-toggle';
+    check.checked = overviewShowStaged; check.setAttribute('aria-label', 'Staged');
+    check.onchange = () => { overviewShowStaged = check.checked; overviewEditing = false;
+      overviewActionIds = {stage: [], unstage: []}; overviewEditorKey = ''; void renderOverviewDiff(); };
+    staged.append(check, document.createTextNode('Staged')); actions.append(staged);
+    if (!displayedReport?.is_draft) {
+      if (overviewMode === 'frozen') {
+        actions.append(tag('Снимок отчёта'));
+        actions.append(button('Текущий diff', 'quiet', () => { overviewMode = 'live'; overviewEditorKey = ''; void renderOverviewDiff(); }));
+      }
+      else {
+        if (displayedReport && snapshot.id !== displayed.id) actions.append(button('Снимок отчёта', 'quiet', () => {
+          overviewMode = 'frozen'; overviewEditing = false; overviewEditorKey = ''; void renderOverviewDiff(); }));
+        if (snapshot.version !== state.snapshot.version) actions.append(button('Открыть актуальный diff', 'quiet', async () => {
+          state = await api('/sync', 'POST', {paths: [overviewFile]}); overviewWorking = state.snapshot;
+          overviewEditorKey = ''; void renderOverviewDiff(); renderOverviewDetail(); }));
+        if (!overviewEditing) actions.append(button('Редактировать', 'outline', overviewEditCurrent));
+        else actions.append(button('Просмотр', 'quiet', () => {
+          if (overviewUnsaved && !confirm('Сбросить несохранённые правки?')) return;
+          overviewEditing = false; overviewUnsaved = false; overviewEditorKey = ''; void renderOverviewDiff(); }));
+        if (overviewEditing) actions.append(button('Сохранить файл', 'primary overview-save', overviewSave));
+        actions.append(button('Stage строк', 'outline overview-stage-lines', () => overviewGitAction('stage', false)));
+        actions.append(button('Stage файла', 'outline overview-stage-all', () => overviewGitAction('stage', true)));
+        if (overviewShowStaged) {
+          actions.append(button('Unstage строк', 'outline overview-unstage-lines', () => overviewGitAction('unstage', false)));
+          actions.append(button('Unstage файла', 'outline overview-unstage-all', () => overviewGitAction('unstage', true)));
+        }
+        actions.append(el('span', 'overview-line-count'));
+      }
     }
   }
+  header.append(actions);
   const oldHeader = $('.overview-diff-header', pane);
   if (oldHeader) oldHeader.replaceWith(header); else pane.prepend(header);
-  const oldActions = $('.overview-diff-actions', pane);
-  if (oldActions) oldActions.replaceWith(actions); else header.after(actions);
   overviewUpdateSave();
   let host = $('.overview-editor-host', pane); if (!host) { host = el('div', 'overview-editor-host'); setupDiffScroll(host); pane.append(host); }
-  if (!overviewFile) {
+  if (!path) {
     overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; overviewEditorKey = '';
     host.replaceChildren(empty('Выберите файл', 'Файлы находятся в дереве слева.'));
     return;
   }
   if (overviewEditor && editorKey === overviewEditorKey) return;
   const revision = ++overviewDiffRevision;
-  const sideA = overviewLayer === 'staged' ? 'head' : 'index';
-  const sideB = overviewLayer === 'staged' ? 'index' : 'work';
-  const url = side => `/snapshots/${snapshot.id}/file?path=${encodeURIComponent(overviewFile)}&side=${side}`;
-  const [before, after] = await Promise.all([api(url(sideA)), api(url(sideB))]);
+  const sideA = overviewShowStaged ? 'head' : 'index';
+  const sideB = 'work';
+  const url = side => `/snapshots/${snapshot.id}/file?path=${encodeURIComponent(path)}&side=${side}`;
+  let before, after, comparison;
+  try {
+    [before, after] = await Promise.all([api(url(sideA)), api(url(sideB))]);
+    if (revision === overviewDiffRevision && overviewShowStaged && !before.unsupported && !after.unsupported &&
+        !before.omitted && !after.omitted) {
+      comparison = await api(`/snapshots/${snapshot.id}/comparison?path=${encodeURIComponent(path)}`);
+    }
+  } catch (error) {
+    if (revision !== overviewDiffRevision || !pane.isConnected) return;
+    host.replaceChildren(empty('Не удалось открыть diff', error.message));
+    return;
+  }
   if (revision !== overviewDiffRevision || view !== 'overview') return;
   overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; host.replaceChildren();
   if (before.unsupported || after.unsupported || before.omitted || after.omitted) {
@@ -790,15 +873,17 @@ async function renderOverviewDiff() {
     overviewEditorKey = editorKey; return;
   }
   overviewInitialContent = after.content; overviewUnsaved = false; overviewEditorKey = editorKey;
+  overviewComparison = comparison;
   overviewEditor = createDiffEditor(host, {before: before.content, after: after.content,
-    editable: overviewMode === 'live' && overviewLayer === 'unstaged' && after.exists,
-    compact: matchMedia('(max-width: 800px)').matches,
+    editable: overviewMode === 'live' && overviewEditing && !overviewShowStaged && after.exists,
+    stagedLines: comparison ? {a: Object.keys(comparison.unstage.a).map(Number),
+      b: Object.keys(comparison.unstage.b).map(Number)} : null,
+    compact: !overviewShowStaged && matchMedia('(max-width: 800px)').matches,
     nonce: $('meta[name="csp-nonce"]').content,
     onChange: content => { overviewUnsaved = content !== overviewInitialContent; overviewUpdateSave(); },
     onSelection: overviewSelectCode});
   overviewEditorResizeObserver = new ResizeObserver(() => overviewEditor?.requestMeasure());
   overviewEditorResizeObserver.observe(host);
-  if (overviewMode === 'live' && overviewLayer === 'staged') host.append(el('p', 'footer-note', 'Для правки переключитесь на working-слой файла. Staged-слой меняется через Stage/Unstage.'));
   overviewUpdateSave();
 }
 function renderOverview(container) {
@@ -908,7 +993,10 @@ function updateSelection(selectionKey) {
   });
 }
 async function act(fragment, action, whole) {
-  const request = {snapshot_id: displayed.id, expected_version: displayed.version, path: fragment.path, action, line_ids: [...selected.get(fragment.path + ':' + fragment.layer)], whole_file: whole, key: key()};
+  const context = displayedReport && !displayedReport.is_draft
+    ? {report_id: displayedReport.id, target_kind: 'summary', target_id: null} : {};
+  const request = {snapshot_id: displayed.id, expected_version: displayed.version, path: fragment.path,
+    action, line_ids: [...selected.get(fragment.path + ':' + fragment.layer)], whole_file: whole, key: key(), ...context};
   const apply = async () => { const op = await api('/operations', 'POST', request); if (op.status !== 'completed') throw new Error(op.error || 'Операция не завершена'); $('#dialog').close(); view = 'changes'; updateNav(); await load(true); toast('Готово. Восстановление доступно в истории действий.'); };
   if (action === 'discard') {
     const preview = await api('/operations/preview', 'POST', request); const content = el('div'); content.append(el('p', 'muted', preview.exists ? 'Так будет выглядеть рабочий файл после отмены. Индекс не изменится.' : 'Рабочий файл будет удалён. Его содержимое сохранится в истории восстановления.'), el('pre', '', preview.content));

@@ -9,16 +9,16 @@ The interface and generated explanations are in Russian.
 ```bash
 python3 -m venv env
 env/bin/python -m pip install -e '.[test]'
-export OPENAI_API_KEY='your-provider-key'
-export OPENAI_BASE_URL='https://api.openai.com/v1'
-export REVIEW_MODEL='your-model-id'
+cp .env.example .env
+# Edit .env with your provider key and model.
 env/bin/review-service --repo /absolute/path/to/git/repository
 ```
 
 Open `http://127.0.0.1:8765`. The command prints the path to a private **browser access
 token file**; copy its contents into the login form. This is separate from the LLM key.
-An explicit `REVIEW_TOKEN` can be used instead. See `.env.example`; environment files
-are not automatically loaded.
+An explicit `REVIEW_TOKEN` can be used instead. The service reads `.env` from the
+current directory at startup, including for the `decision` command. Existing process
+environment variables take precedence. Restart after editing `.env`.
 
 The reviewed repository must already exist. The service does not initialize or commit
 repositories. It supports Linux and macOS (uses `fcntl` for the repository process lock).
@@ -122,14 +122,19 @@ Restart the service after changing `.review.toml`.
    appear after their structure and references are checked. The **Предпросмотр** is
    read-only until the full report passes validation. Every fragment in the finished
    report is represented, including an explicit unexplained section.
-5. Review decisions, ask questions, and select individual added/deleted lines. For a
-   replacement, select both its deletion and addition if you want the whole replacement.
-6. Stage/unstage selected changes, or preview and discard working changes. **История
-   действий** provides undo when the repository still matches the operation's result.
+5. Review decisions, ask questions, and select individual added/deleted lines. In the
+   report diff, Stage works in read-only mode. Enable **Staged** to compare HEAD with
+   the working file, see staged lines separately, and Stage/Unstage selected lines.
+   Selecting a replacement in this view includes both sides of that replacement.
+6. Stage/unstage selected changes, or preview and discard working changes. Actions
+   made from a report item appear in that item's journal; **История действий** also
+   lists Git actions and provides undo while the repository matches their result.
 
 Git state and selected session histories are checked every five seconds. Code on screen
-stays at its snapshot until refreshed. A stale snapshot cannot mutate Git. Report
-generation creates a new version; older reports and their conversations are retained.
+stays at its snapshot until refreshed. A stale snapshot cannot mutate Git. The report's
+original snapshot and conversation context remain immutable; report actions advance a
+separate working snapshot for the current diff. Report generation creates a new version;
+older reports and their conversations are retained.
 Review marks are carried forward only for identical explanations and fragment references.
 
 Drafts retain their own frozen snapshot and source evidence. Refreshing the browser
@@ -225,11 +230,11 @@ All `/api/v1` routes require `Authorization: Bearer <browser-token>`.
 | `GET /models`, `PUT /model` | Discover provider model IDs; select a model for new reports and questions |
 | `GET/PUT /sessions`, `POST /import`, `GET /sources` | Discover/select sessions, import OpenCode history, inspect evidence |
 | `POST /reviews`, `POST /untracked`, `POST /decisions` | Start a baseline, include new files, record a decision |
-| `GET /snapshots/{id}`, `GET /snapshots/{id}/file` | Immutable diff and file context (`path`, `side` query parameters) |
-| `POST /reports`, `GET /reports/{id}` | Start generation (202/job), retrieve a report |
+| `GET /snapshots/{id}`, `GET /snapshots/{id}/file`, `GET /snapshots/{id}/comparison` | Immutable diff, file context and HEAD-to-work line mappings (`path`, plus `side` for file content) |
+| `POST /reports`, `GET /reports/{id}` | Start generation (202/job), retrieve a report with its working snapshot and item journal |
 | `GET /report-drafts/{job_id}` | Retrieve a saved partial report, its status and revision |
 | `PATCH /reports/{id}/items/{item}` | Set `reviewed` independently of staging |
-| `POST /operations/preview`, `POST /operations` | Preview/apply selected changes |
+| `POST /operations/preview`, `POST /operations`, `POST /operations/edit` | Preview/apply selected changes or save a working file |
 | `POST /operations/{id}/undo` | Restore a recorded operation using a new idempotency `key` |
 | `POST /questions`, `GET /messages` | Ask about a snapshot/item, retrieve conversation |
 | `GET /events`, `POST /jobs/{id}/cancel` | SSE job/delta notifications and cancellation |
@@ -253,6 +258,9 @@ include the frozen `model` ID. These are additive fields; no database migration 
 
 An operation supplies `snapshot_id`, `expected_version`, `path`, `action`
 (`stage`, `unstage`, `discard`), `line_ids`, `whole_file` and a unique `key`.
+Git operations and file edits may also supply `report_id`, `target_kind`
+(`summary`, `item` or `finding`) and `target_id` to advance the report's working
+snapshot and record a scoped journal entry. Undo inherits that scope.
 Line IDs come from the returned diff and are scoped to its snapshot, file and layer.
 Retries with the same key return the recorded result; reusing the key with different
 parameters is rejected. Conflicts return HTTP 409. The server never accepts a patch

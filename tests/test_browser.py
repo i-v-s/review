@@ -157,6 +157,74 @@ async def test_complete_review_in_browser(client, service, repo, fake_llm, viewp
 
 
 @pytest.mark.browser
+@pytest.mark.parametrize('viewport', [{'width': 1440, 'height': 900}, {'width': 390, 'height': 844}])
+async def test_overview_stage_without_edit_and_item_journal(client, service, repo, viewport):
+    (repo / 'example.py').write_text('ONE\ntwo\nthree\nfour\n')
+    git_command(repo, 'add', 'example.py')
+    (repo / 'example.py').write_text('ONE\nTWO\nthree\nfour\n')
+    snapshot = await service.refresh()
+    fragment = next(f for f in diff_fragments(snapshot) if f['layer'] == 'unstaged')
+    report = {'id': 'browser-report', 'created_at': '2026-01-01T00:00:00+00:00',
+              'snapshot_id': snapshot.id, 'snapshot_version': snapshot.version,
+              'summary': 'Проверить изменения.', 'items': [
+                  {'id': 'browser-item', 'section': 'Проверка', 'title': 'Пункт с diff',
+                   'explanation': 'Проверить строки.', 'reviewed': False,
+                   'fragment_ids': [fragment['id']], 'source_ids': []}], 'findings': []}
+    await service.store.put('report', report['id'], report)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(executable_path=os.environ.get('REVIEW_TEST_BROWSER'))
+        page = await browser.new_page(viewport=viewport, is_mobile=viewport['width'] < 700)
+        await page.add_init_script("sessionStorage.setItem('review-token', 'test-secret');")
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        try:
+            await page.goto(str(client.make_url('/')))
+            await expand_report_section(page, 'Проверка')
+            await page.get_by_role('button', name='Пункт с diff', exact=True).click()
+            stage = page.get_by_role('button', name='Stage строк', exact=True)
+            await expect(page.get_by_role('button', name='Stage файла', exact=True)).to_be_enabled()
+            await expect(page.locator('.overview-editor-host .cm-content').last).to_have_attribute('contenteditable', 'false')
+            header = page.locator('.overview-diff-header')
+            assert (await header.bounding_box())['height'] < 50
+            await page.get_by_label('Staged').check()
+            await expect(page.locator('.cm-review-staged-line').first).to_be_visible()
+            changed = page.locator('.overview-editor-host .cm-changedText').first
+            await expect(changed).to_be_visible()
+            assert await changed.evaluate('(node) => getComputedStyle(node).backgroundImage') == 'none'
+            await page.locator('.overview-editor-host .cm-merge-b .cm-line').filter(has_text='TWO').dblclick()
+            await expect(stage).to_be_enabled()
+            await stage.click()
+            await expect(page.locator('.overview-notice').filter(has_text='прежнему снимку')).to_have_count(0)
+            await expect(page.locator('.overview-journal-row')).to_have_count(1)
+            assert git_command(repo, 'show', ':example.py') == b'ONE\nTWO\nthree\nfour\n'
+            await page.locator('.overview-editor-host .cm-merge-b .cm-line').filter(has_text='TWO').dblclick()
+            unstage = page.get_by_role('button', name='Unstage строк', exact=True)
+            await expect(unstage).to_be_enabled()
+            await unstage.click()
+            await expect(page.locator('.overview-journal-row')).to_have_count(2)
+            assert git_command(repo, 'show', ':example.py') == b'ONE\ntwo\nthree\nfour\n'
+            await page.locator('.overview-journal-row').first.get_by_role('button', name='Откатить').click()
+            await expect(page.locator('.overview-journal-row')).to_have_count(3)
+            assert git_command(repo, 'show', ':example.py') == b'ONE\nTWO\nthree\nfour\n'
+            await page.get_by_label('Staged').uncheck()
+            await page.get_by_role('button', name='Редактировать', exact=True).click()
+            editor = page.locator('.overview-editor-host .cm-content').last
+            await expect(editor).to_have_attribute('contenteditable', 'true')
+            await editor.click()
+            await page.keyboard.press('ControlOrMeta+End')
+            await page.keyboard.insert_text('extra\n')
+            await expect(page.get_by_role('button', name='Сохранить файл')).to_be_enabled()
+            await page.get_by_role('button', name='Сохранить файл').click()
+            await expect(page.locator('.overview-journal-row')).to_have_count(4)
+            await expect(page.locator('.overview-notice').filter(has_text='прежнему снимку')).to_have_count(0)
+            assert (repo / 'example.py').read_text().endswith('extra\n')
+            assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+            assert errors == []
+        finally:
+            await browser.close()
+
+
+@pytest.mark.browser
 @pytest.mark.parametrize('viewport', [{'width': 1440, 'height': 1000}, {'width': 390, 'height': 844}])
 async def test_live_draft_reconnect_scroll_and_completion(client, service, repo, fake_llm, viewport):
     (repo / 'example.py').write_text(''.join(f'changed line {n}\n' for n in range(120)))
