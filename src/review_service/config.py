@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+DEFAULT_FILE_FILTERS = {
+    "tests": ["tests/*", "*/tests/*", "test_*.py", "*/test_*.py", "*_test.py", "*.test.*", "*.spec.*"],
+    "docs": ["docs/*", "*/docs/*", "README*", "*.md", "*.rst", "*.adoc"],
+}
 
 
 @dataclass
@@ -29,6 +36,7 @@ class Config:
     llm_max_retries: int = 0
     llm_structured_output: bool = True
     llm_proxy: str = field(default="", repr=False)
+    file_filters: dict[str, list[str]] = field(init=False)
 
     def __post_init__(self):
         self.repo = self.repo.expanduser().resolve()
@@ -45,6 +53,24 @@ class Config:
             raise ValueError("LLM max retries cannot be negative")
         if self.max_context_chars <= 0 or self.max_output_tokens <= 0:
             raise ValueError("LLM context and output limits must be greater than zero")
+        rules_path = self.repo / ".review.toml"
+        self.file_filters = {name: patterns.copy() for name, patterns in DEFAULT_FILE_FILTERS.items()}
+        if rules_path.exists():
+            try:
+                rules = tomllib.loads(rules_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+                raise ValueError(f"{rules_path}: не удалось прочитать настройки фильтров: {exc}") from exc
+            if set(rules) != {"file_filters"} or not isinstance(rules["file_filters"], dict):
+                raise ValueError(f"{rules_path}: ожидается таблица [file_filters]")
+            filters = rules["file_filters"]
+            if set(filters) != {"tests", "docs"}:
+                raise ValueError(f"{rules_path}: укажите списки tests и docs")
+            for name, patterns in filters.items():
+                if (not isinstance(patterns, list) or
+                        any(not isinstance(pattern, str) or not pattern or len(pattern) > 256 or
+                            any(char in pattern for char in "[]\\") for pattern in patterns)):
+                    raise ValueError(f"{rules_path}: {name} должен быть списком glob-шаблонов с * и ?")
+                self.file_filters[name] = patterns
         if self.llm_proxy:
             try:
                 proxy = urlsplit(self.llm_proxy)

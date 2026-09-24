@@ -1,13 +1,99 @@
 import asyncio
 import json
 import os
+import re
 
 import pytest
 from playwright.async_api import async_playwright, expect
 
 from review_service.models import SourceEvent
 from review_service.git import diff_fragments
+from conftest import git_command
 from test_llm import attach, fake_llm
+
+
+async def expand_report_section(page, name='Корректность'):
+    toggle = page.locator('.tree-section-row').filter(has_text=name).get_by_role('button')
+    await expect(toggle).to_be_visible()
+    if await toggle.get_attribute('aria-expanded') == 'false':
+        await toggle.click()
+
+
+@pytest.mark.browser
+@pytest.mark.parametrize('viewport', [{'width': 1280, 'height': 800}, {'width': 390, 'height': 844}])
+async def test_shared_sidebar_tree_filters_counts_and_width(client, service, repo, fake_llm, viewport):
+    (repo / 'tests').mkdir()
+    (repo / 'docs').mkdir()
+    (repo / 'tests/test_case.py').write_text('assert True\n')
+    (repo / 'docs/guide.md').write_text('original\n')
+    git_command(repo, 'add', 'tests', 'docs')
+    git_command(repo, 'commit', '-qm', 'Add files')
+    (repo / 'example.py').write_text(''.join(f'changed {n}\n' for n in range(80)))
+    (repo / 'tests/test_case.py').write_text('assert False\n')
+    (repo / 'docs/guide.md').write_text('updated\n')
+    (repo / 'staged.py').write_text('staged\n')
+    git_command(repo, 'add', 'staged.py')
+    await service.refresh()
+    llm = await attach(service, fake_llm)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(executable_path=os.environ.get('REVIEW_TEST_BROWSER'))
+        page = await browser.new_page(viewport=viewport, is_mobile=viewport['width'] < 700)
+        await page.add_init_script("sessionStorage.setItem('review-token', 'test-secret');")
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        try:
+            await page.goto(str(client.make_url('/')))
+            await expect(page.locator('#sidebar-workspace')).to_be_visible()
+            await page.locator('#generate').click()
+            await expect(page.get_by_label('Версия отчёта')).to_have_value(re.compile('^report:'), timeout=15000)
+            await expect(page.locator('#sidebar-report')).to_be_visible()
+            await expect(page.locator('.tree-section-row').first.get_by_role('button')).to_have_attribute('aria-expanded', 'false')
+            await page.get_by_role('button', name='Развернуть: Описание').click()
+            summary_files = page.locator('#report-tree > .tree-group .tree-entry.level-1')
+            code = summary_files.filter(has_text='example.py')
+            await expect(code).to_be_visible()
+            await expect(code).to_contain_text('+80')
+            await expect(code).to_contain_text('−4')
+            await expect(page.locator('#report-tree .tree-entry.level-1').filter(has_text='staged.py')).to_have_count(0)
+            await expect(page.locator('#report-tree .tree-entry.level-1').filter(has_text='tests/test_case.py')).to_have_count(0)
+            await expect(page.locator('#report-tree .tree-entry.level-1').filter(has_text='docs/guide.md')).to_have_count(0)
+            await page.locator('[data-file-filter="tests"]').check()
+            await expect(summary_files.filter(has_text='tests/test_case.py')).to_be_visible()
+            await page.locator('[data-file-filter="docs"]').check()
+            await expect(summary_files.filter(has_text='docs/guide.md')).to_be_visible()
+            await expand_report_section(page)
+            if viewport['width'] > 800:
+                splitter = page.get_by_role('separator', name='Ширина левой панели')
+                await splitter.focus()
+                await page.keyboard.press('ArrowRight')
+                after_key = (await page.locator('#sidebar').bounding_box())['width']
+                assert after_key > 250
+                split_box = await splitter.bounding_box()
+                await page.mouse.move(split_box['x'] + split_box['width'] / 2, split_box['y'] + split_box['height'] / 2)
+                await page.mouse.down()
+                await page.mouse.move(split_box['x'] + split_box['width'] / 2 + 40, split_box['y'] + split_box['height'] / 2)
+                await page.mouse.up()
+                assert (await page.locator('#sidebar').bounding_box())['width'] > after_key
+            await page.reload()
+            await expect(page.locator('#sidebar-report')).to_be_visible()
+            await expect(page.get_by_role('button', name='Свернуть: Описание')).to_have_attribute('aria-expanded', 'true')
+            await expect(page.get_by_role('button', name='Свернуть: Корректность')).to_have_attribute('aria-expanded', 'true')
+            await expect(page.locator('[data-file-filter="tests"]')).not_to_be_checked()
+            await expect(page.locator('[data-file-filter="docs"]')).not_to_be_checked()
+            await expect(code).to_be_visible()
+            if viewport['width'] > 800:
+                assert (await page.locator('#sidebar').bounding_box())['width'] > 250
+            else:
+                await expect(page.locator('#sidebar-splitter')).to_be_hidden()
+            await page.locator('#sidebar-back').click()
+            await expect(page.locator('#sidebar-workspace')).to_be_visible()
+            await page.locator('[data-view="overview"]').click()
+            await expect(page.locator('#sidebar-report')).to_be_visible()
+            assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+            assert errors == []
+        finally:
+            await browser.close()
+            await llm.close()
 
 
 @pytest.mark.browser
@@ -30,9 +116,10 @@ async def test_complete_review_in_browser(client, service, repo, fake_llm, viewp
             await page.get_by_role('button', name='Открыть workspace').click()
             await expect(page.locator('#workspace')).to_be_visible()
             await page.locator('#generate').click()
-            await expect(page.get_by_role('button', name='Сохраняем инвариант')).to_be_visible(timeout=15000)
-            await page.get_by_role('button', name='Сохраняем инвариант').click()
-            await expect(page.get_by_role('heading', name='Сохраняем инвариант')).to_be_visible()
+            await expand_report_section(page)
+            await expect(page.get_by_role('button', name='Сохраняем инвариант', exact=True)).to_be_visible(timeout=15000)
+            await page.get_by_role('button', name='Сохраняем инвариант', exact=True).click()
+            await expect(page.get_by_role('heading', name='Сохраняем инвариант', exact=True)).to_be_visible()
             await page.get_by_role('button', name='Источник 1').click()
             await expect(page.locator('#dialog')).to_contain_text('Use explicit boundary checks.')
             await page.locator('#dialog-close').click()
@@ -43,6 +130,7 @@ async def test_complete_review_in_browser(client, service, repo, fake_llm, viewp
             await page.get_by_role('button', name='Спросить ↑').click()
             await expect(page.locator('#chat-messages')).to_contain_text('Проверка граничных случаев необходима.', timeout=15000)
             await page.screenshot(path=f"test-results/review-{viewport['width']}.png", full_page=True)
+            await page.locator('#sidebar-back').click()
             await page.locator('[data-view="changes"]').click()
             first = page.locator('.diff').first
             await first.locator('input[data-line="d:0"]').check()
@@ -97,12 +185,13 @@ async def test_live_draft_reconnect_scroll_and_completion(client, service, repo,
             await page.get_by_role('button', name='Открыть workspace').click()
             await page.locator('#generate').click()
             await expect(page.locator('.summary-text')).to_have_text('Постепенный')
-            await expect(page.get_by_role('button', name='Первый пункт')).to_have_count(0)
+            await expect(page.get_by_role('button', name='Первый пункт', exact=True)).to_have_count(0)
             assert not await service.store.list('report')
             gates[0].set()
-            await expect(page.get_by_role('button', name='Первый пункт')).to_be_visible()
-            await page.get_by_role('button', name='Первый пункт').click()
-            await expect(page.get_by_role('heading', name='Первый пункт')).to_be_visible()
+            await expand_report_section(page, 'Проверка')
+            await expect(page.get_by_role('button', name='Первый пункт', exact=True)).to_be_visible()
+            await page.get_by_role('button', name='Первый пункт', exact=True).click()
+            await expect(page.get_by_role('heading', name='Первый пункт', exact=True)).to_be_visible()
             await expect(page.get_by_label('Просмотрено')).to_have_count(0)
             await expect(page.get_by_role('button', name='Спросить об этом')).to_be_disabled()
             await expect(page.get_by_role('button', name='Stage файла')).to_have_count(0)
@@ -110,8 +199,9 @@ async def test_live_draft_reconnect_scroll_and_completion(client, service, repo,
             await expect(page.locator('#dialog')).to_contain_text('Frozen streaming evidence')
             await page.locator('#dialog-close').click()
             await page.reload()
-            await expect(page.get_by_role('button', name='Первый пункт')).to_be_visible()
-            await page.get_by_role('button', name='Первый пункт').click()
+            await expand_report_section(page, 'Проверка')
+            await expect(page.get_by_role('button', name='Первый пункт', exact=True)).to_be_visible()
+            await page.get_by_role('button', name='Первый пункт', exact=True).click()
             # Force an SSE disconnect; connect() must resync the saved draft.
             for queue in service.subscribers:
                 queue.put_nowait({'type': 'shutdown'})
@@ -119,15 +209,16 @@ async def test_live_draft_reconnect_scroll_and_completion(client, service, repo,
             await expect(page.locator('#connection')).to_have_text('Подключено', timeout=10000)
             await page.locator('.overview-editor-host .cm-editor').first.evaluate('(node) => window.previewEditor = node')
             gates[1].set()
-            await expect(page.get_by_role('button', name='Второй пункт')).to_be_attached()
+            await expect(page.get_by_role('button', name='Второй пункт', exact=True)).to_be_attached()
             assert await page.locator('.overview-editor-host .cm-editor').first.evaluate('(node) => node === window.previewEditor')
             assert not await service.store.list('report')
             assert await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
             await page.screenshot(path=f"test-results/draft-{viewport['width']}.png", full_page=True)
             control['before_finish'].set()
             await expect(page.locator('.draft-status')).to_have_count(0)
-            await expect(page.get_by_role('button', name='Первый пункт')).to_be_visible()
-            await page.get_by_role('button', name='Первый пункт').click()
+            await expand_report_section(page, 'Проверка')
+            await expect(page.get_by_role('button', name='Первый пункт', exact=True)).to_be_visible()
+            await page.get_by_role('button', name='Первый пункт', exact=True).click()
             await expect(page.get_by_label('Просмотрено')).to_be_enabled()
             await expect(page.get_by_role('button', name='Спросить об этом')).to_be_enabled()
             assert errors == []
@@ -155,7 +246,8 @@ async def test_cancelled_draft_stays_selectable_with_previous_report(client, ser
             await page.get_by_role('button', name='Открыть workspace').click()
             await page.locator('#generate').click()
             await expect(page.locator('.draft-status')).to_contain_text('Генерируется')
-            await expect(page.get_by_role('button', name='Сохраняем инвариант')).to_be_visible()
+            await expand_report_section(page)
+            await expect(page.get_by_role('button', name='Сохраняем инвариант', exact=True)).to_be_visible()
             job_id = service.active_report
             await page.get_by_label('Версия отчёта').select_option('report:' + previous['report_id'])
             await expect(page.locator('.draft-status')).to_have_count(0)
@@ -167,7 +259,8 @@ async def test_cancelled_draft_stays_selectable_with_previous_report(client, ser
             await expect(page.locator('.draft-status')).to_contain_text('Генерация отменена')
             await page.reload()
             await expect(page.locator('.draft-status')).to_contain_text('Не завершён')
-            await expect(page.get_by_role('button', name='Сохраняем инвариант')).to_be_visible()
+            await expand_report_section(page)
+            await expect(page.get_by_role('button', name='Сохраняем инвариант', exact=True)).to_be_visible()
         finally:
             control['before_finish'].set()
             await browser.close()
@@ -206,7 +299,8 @@ async def test_report_start_and_reload_do_not_fetch_an_unsaved_draft(client, ser
             assert failed_responses == [], console_errors
             assert console_errors == []
             ready.set()
-            await expect(page.get_by_role('button', name='Сохраняем инвариант')).to_be_visible(timeout=15000)
+            await expand_report_section(page)
+            await expect(page.get_by_role('button', name='Сохраняем инвариант', exact=True)).to_be_visible(timeout=15000)
         finally:
             ready.set()
             if service.active_report in service.tasks:
@@ -235,7 +329,8 @@ async def test_reload_of_job_without_a_draft_uses_saved_report(client, service, 
         page.on('console', lambda message: console_errors.append((message.text, message.location)) if message.type == 'error' else None)
         try:
             await page.goto(str(client.make_url('/')))
-            await expect(page.get_by_role('button', name='Сохраняем инвариант')).to_be_visible()
+            await expand_report_section(page)
+            await expect(page.get_by_role('button', name='Сохраняем инвариант', exact=True)).to_be_visible()
             await expect(page.get_by_label('Версия отчёта')).to_have_value('report:' + saved['report_id'])
             assert failed_responses == [], console_errors
             assert console_errors == []

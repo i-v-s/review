@@ -92,6 +92,7 @@ class Service:
         latest = reports[-1] if reports else None
         return dict(
             repo=str(self.git.root), snapshot=await self.public_snapshot(self.current),
+            file_filters=self.config.file_filters,
             baseline_id=baseline.id if baseline else None,
             preexisting_paths=[f.path for f in baseline.files if f.dirty] if baseline else [],
             retrospective=await self.store.setting("retrospective", True),

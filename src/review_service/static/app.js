@@ -19,6 +19,9 @@ let overviewFile = null, overviewLayer = null, overviewMode = 'frozen', overview
 let overviewInitialContent = '', overviewUnsaved = false, overviewDiffRevision = 0;
 let overviewSelection = [], overviewLineIds = [], chatTargetKind = 'all', chatTargetId = null;
 let chatExpanded = false, uiRepo = '', overviewSplitRatio = .5, overviewResizeObserver, overviewEditorResizeObserver;
+let sidebarMode = 'workspace', sidebarContext = '', sidebarWidth = 250, sidebarPreferredWidth = 250;
+let showTests = false, showDocs = false, treeNodeNumber = 0;
+const globCache = new Map();
 const draftLabel = draft => draft.status === 'running' ? 'Генерируется' : 'Не завершён';
 function rememberReport(value) { reportSelection = value; sessionStorage.setItem('review-report-selection', value); }
 function uiKey(name) { return `review-ui:${state.repo}:${name}`; }
@@ -31,7 +34,34 @@ function restoreUiPreferences() {
   const savedRatio = loadUiPreference('detail-ratio');
   const ratio = savedRatio === null ? NaN : Number(savedRatio);
   overviewSplitRatio = Number.isFinite(ratio) && ratio >= 0 && ratio <= 1 ? ratio : .5;
+  const savedWidth = Number(loadUiPreference('sidebar-width'));
+  sidebarPreferredWidth = Number.isFinite(savedWidth) && savedWidth >= 180 ? savedWidth : 250;
+  showTests = false; showDocs = false;
+  sidebarContext = '';
+  updateSidebarWidth();
   updateChatExpansion();
+}
+function sidebarWidthLimit() { return Math.max(180, Math.min(480, Math.floor(window.innerWidth * .4))); }
+function updateSidebarWidth() {
+  sidebarWidth = Math.max(180, Math.min(sidebarWidthLimit(), sidebarPreferredWidth));
+  $('#workspace').style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+  const splitter = $('#sidebar-splitter');
+  splitter.setAttribute('aria-valuemax', String(sidebarWidthLimit()));
+  splitter.setAttribute('aria-valuenow', String(sidebarWidth));
+}
+function setSidebarWidth(width, persist = false) {
+  sidebarPreferredWidth = width;
+  updateSidebarWidth();
+  if (persist && state) { sidebarPreferredWidth = sidebarWidth; saveUiPreference('sidebar-width', sidebarWidth); }
+}
+function updateSidebarMode() {
+  const context = view === 'overview' ? (displayedReport ? 'report' : 'empty') : 'other';
+  if (context !== sidebarContext) {
+    sidebarContext = context;
+    sidebarMode = context === 'report' ? 'tree' : 'workspace';
+  }
+  $('#sidebar-workspace').hidden = sidebarMode !== 'workspace';
+  $('#sidebar-report').hidden = sidebarMode !== 'tree';
 }
 function updateChatExpansion() {
   const panel = $('#chat-panel') || $('#chat-panel', overviewRoot);
@@ -208,6 +238,36 @@ const chromeSizeObserver = new ResizeObserver(() => {
   $('#workspace').style.setProperty('--sidebar-height', `${$('.sidebar').offsetHeight}px`);
 });
 chromeSizeObserver.observe($('.topbar')); chromeSizeObserver.observe($('.sidebar'));
+const sidebarSplitter = $('#sidebar-splitter');
+sidebarSplitter.onpointerdown = event => {
+  if (event.button !== 0 || matchMedia('(max-width: 800px)').matches) return;
+  sidebarSplitter.setPointerCapture(event.pointerId);
+  sidebarSplitter.classList.add('dragging');
+  event.preventDefault();
+};
+sidebarSplitter.onpointermove = event => {
+  if (sidebarSplitter.hasPointerCapture(event.pointerId)) setSidebarWidth(event.clientX - $('.layout').getBoundingClientRect().left);
+};
+const finishSidebarResize = event => {
+  if (!sidebarSplitter.hasPointerCapture(event.pointerId)) return;
+  setSidebarWidth(event.clientX - $('.layout').getBoundingClientRect().left, true);
+  sidebarSplitter.classList.remove('dragging');
+  sidebarSplitter.releasePointerCapture(event.pointerId);
+};
+sidebarSplitter.onpointerup = finishSidebarResize;
+sidebarSplitter.onpointercancel = event => {
+  sidebarSplitter.classList.remove('dragging');
+  if (sidebarSplitter.hasPointerCapture(event.pointerId)) sidebarSplitter.releasePointerCapture(event.pointerId);
+};
+sidebarSplitter.onkeydown = event => {
+  const step = event.shiftKey ? 50 : 10;
+  const target = event.key === 'ArrowLeft' ? sidebarWidth - step : event.key === 'ArrowRight' ? sidebarWidth + step :
+    event.key === 'Home' ? 180 : event.key === 'End' ? sidebarWidthLimit() : null;
+  if (target === null) return;
+  event.preventDefault(); setSidebarWidth(target, true);
+};
+window.addEventListener('resize', updateSidebarWidth);
+$('#sidebar-back').onclick = () => { sidebarMode = 'workspace'; updateSidebarMode(); };
 
 async function load(adopt = false) {
   const revision = ++loadRevision;
@@ -252,7 +312,11 @@ function renderJobs() {
   for (const job of running) node.append(el('span', '', (job.kind === 'report' ? 'Готовим отчёт…' : 'Готовим ответ…') + (job.model ? ` · ${job.model}` : '')), button('Отменить', 'quiet', () => api('/jobs/' + job.id + '/cancel', 'POST')));
 }
 function updateNav() { $$('.nav-button').forEach(b => b.classList.toggle('active', b.dataset.view === view)); }
-$$('.nav-button').forEach(b => b.onclick = () => guard(async () => { view = b.dataset.view; updateNav(); await load(true); if (view === 'sources') await refreshSources(); }));
+$$('.nav-button').forEach(b => b.onclick = () => guard(async () => {
+  view = b.dataset.view; updateNav(); await load(true);
+  if (view === 'overview' && displayedReport) { sidebarMode = 'tree'; updateSidebarMode(); }
+  if (view === 'sources') await refreshSources();
+}));
 $('#refresh').onclick = () => guard(async () => { $('#refresh').disabled = true; try { await api('/sync', 'POST'); await load(true); } finally { $('#refresh').disabled = false; } });
 $('#generate').onclick = () => guard(async () => {
   const job = await api('/reports', 'POST'); rememberReport('draft:' + job.id);
@@ -264,6 +328,7 @@ $('#baseline').onclick = () => {
 
 function render(preserve = false) {
   if (!state) return;
+  updateSidebarMode();
   const content = el('div');
   const x = window.scrollX, y = window.scrollY;
   $('#page-title').textContent = {overview: 'Обзор изменений', changes: 'Изменения кода', sources: 'Контекст и источники', history: 'История действий'}[view];
@@ -330,19 +395,82 @@ function overviewChoose(kind, id = null, file = null, layer = null) {
   render(); updateChatSelections();
 }
 function overviewTreeButton(label, kind, id, file = null, layer = null, level = 0, badge = '') {
-  const b = button(label, 'tree-entry level-' + level, () => overviewChoose(kind, id, file, layer));
+  const b = button('', 'tree-entry level-' + level, () => overviewChoose(kind, id, file, layer));
+  b.append(el('span', 'tree-label', label));
   b.classList.toggle('active', overviewTarget.kind === kind && overviewTarget.id === id &&
     (file ? overviewFile === file && overviewLayer === layer : !overviewFile));
   if (badge) b.append(el('span', 'tree-badge', badge));
   b.title = file || label;
   return b;
 }
-function overviewTreeGroup(tree, label, kind, id, target, level = 0) {
+function fileCategory(path) {
+  const patterns = state.file_filters || {};
+  for (const name of ['tests', 'docs']) {
+    if ((patterns[name] || []).some(pattern => {
+      if (!globCache.has(pattern)) {
+        const source = [...pattern].map(char => char === '*' ? '.*' : char === '?' ? '.' :
+          '\\.^$+()|{}[]'.includes(char) ? '\\' + char : char).join('');
+        globCache.set(pattern, new RegExp('^' + source + '$', 'i'));
+      }
+      return globCache.get(pattern).test(path);
+    })) return name;
+  }
+  return 'code';
+}
+function visibleTreeFile(path) {
+  const category = fileCategory(path);
+  return category === 'code' || category === 'tests' && showTests || category === 'docs' && showDocs;
+}
+function treeOpenSet() {
+  try {
+    const saved = JSON.parse(loadUiPreference('tree-open:' + reportSelection) || '[]');
+    return new Set(Array.isArray(saved) ? saved : []);
+  } catch { return new Set(); }
+}
+function treeDisclosure(key, label, children, open) {
+  const toggle = button(open.has(key) ? '▾' : '▸', 'tree-disclosure', () => {
+    if (open.has(key)) open.delete(key); else open.add(key);
+    const expanded = open.has(key);
+    children.hidden = !expanded;
+    toggle.textContent = expanded ? '▾' : '▸';
+    toggle.setAttribute('aria-expanded', String(expanded));
+    toggle.setAttribute('aria-label', `${expanded ? 'Свернуть' : 'Развернуть'}: ${label}`);
+    saveUiPreference('tree-open:' + reportSelection, JSON.stringify([...open]));
+  });
+  toggle.setAttribute('aria-expanded', String(open.has(key)));
+  toggle.setAttribute('aria-label', `${open.has(key) ? 'Свернуть' : 'Развернуть'}: ${label}`);
+  toggle.setAttribute('aria-controls', children.id);
+  return toggle;
+}
+function overviewTreeGroup(tree, label, kind, id, target, open, statsByPath) {
   const wrap = el('div', 'tree-group');
-  wrap.append(overviewTreeButton(label, kind, id, null, null, level, target?.reviewed ? '✓' : ''));
-  for (const f of overviewFiles(target)) wrap.append(overviewTreeButton(
-    `${f.path} · ${f.layer === 'staged' ? 'staged' : 'working'}`, kind, id, f.path, f.layer, level + 1));
+  const files = overviewFiles(target).filter(f => f.layer === 'unstaged' && visibleTreeFile(f.path));
+  const row = el('div', 'tree-row');
+  const children = el('div', 'tree-children'); children.id = `tree-children-${++treeNodeNumber}`;
+  const nodeKey = `${kind}:${id || ''}`;
+  if (files.length) row.append(treeDisclosure(nodeKey, label, children, open));
+  else row.append(el('span', 'tree-disclosure-spacer'));
+  row.append(overviewTreeButton(label, kind, id, null, null, 0, target?.reviewed ? '✓' : ''));
+  wrap.append(row);
+  for (const f of files) {
+    const entry = overviewTreeButton(f.path, kind, id, f.path, f.layer, 1);
+    const stats = statsByPath.get(f.path) || {add: 0, delete: 0};
+    entry.append(el('span', 'tree-add', `+${stats.add}`), el('span', 'tree-delete', `−${stats.delete}`));
+    children.append(entry);
+  }
+  children.hidden = !open.has(nodeKey);
+  wrap.append(children);
   tree.append(wrap);
+}
+function overviewTreeSection(tree, label, key, items, open, statsByPath) {
+  const wrap = el('div', 'tree-section');
+  const children = el('div', 'tree-section-children'); children.id = `tree-children-${++treeNodeNumber}`;
+  const heading = el('div', 'tree-section-row');
+  heading.append(treeDisclosure(key, label, children, open), el('span', 'tree-heading', label));
+  wrap.append(heading);
+  items.forEach(item => overviewTreeGroup(children, item.title, item.kind, item.id, item, open, statsByPath));
+  children.hidden = !open.has(key);
+  wrap.append(children); tree.append(wrap);
 }
 function overviewProgress() {
   const total = (displayedReport?.items?.length || 0) + (displayedReport?.findings?.length || 0);
@@ -431,34 +559,19 @@ function setupDiffScroll(host) {
     }
   };
 }
-function renderOverviewWorkspace(container) {
-  const rootKey = `${reportSelection}:${displayed.id}`;
-  if (!overviewRoot || overviewRootKey !== rootKey) {
-    overviewResizeObserver?.disconnect(); overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; overviewEditorKey = ''; overviewRootKey = rootKey;
-    overviewTarget = {kind: 'summary', id: null}; overviewFile = null; overviewLayer = null;
-    overviewMode = 'frozen'; overviewUnsaved = false; overviewSelection = [];
-    overviewRoot = el('div', 'overview-workspace');
-    const grid = el('div', 'overview-grid');
-    const tree = el('nav', 'overview-tree'); tree.setAttribute('aria-label', 'Дерево отчёта');
-    const center = el('div', 'overview-center');
-    const detail = el('section', 'overview-detail'); detail.id = 'overview-detail';
-    const diff = el('section', 'overview-diff'); diff.id = 'overview-diff';
-    const splitter = el('div', 'overview-splitter'); splitter.tabIndex = 0;
-    splitter.setAttribute('role', 'separator'); splitter.setAttribute('aria-label', 'Разделитель текста и диффа');
-    splitter.setAttribute('aria-orientation', 'horizontal'); splitter.setAttribute('aria-controls', 'overview-detail overview-diff');
-    splitter.setAttribute('aria-valuemin', '0'); splitter.setAttribute('aria-valuemax', '100');
-    setupOverviewSplitter(splitter);
-    center.append(detail, splitter, diff, el('div', 'overview-chat-slot'));
-    grid.append(tree, center); overviewRoot.append(grid);
-    overviewResizeObserver = new ResizeObserver(updateOverviewSplit); overviewResizeObserver.observe(center);
+function renderOverviewTree(focusFilter = '') {
+  const tree = $('#report-tree');
+  const previousScroll = tree.scrollTop;
+  treeNodeNumber = 0;
+  const open = treeOpenSet();
+  const statsByPath = new Map();
+  for (const fragment of displayed.fragments) {
+    if (fragment.layer !== 'unstaged') continue;
+    if (!statsByPath.has(fragment.path)) statsByPath.set(fragment.path, {add: 0, delete: 0});
+    const stats = statsByPath.get(fragment.path);
+    for (const row of fragment.rows) if (row.kind === 'add' || row.kind === 'delete') stats[row.kind]++;
   }
-  container.append(overviewRoot);
-  $('.page-heading').hidden = true;
-  const chatPanel = $('#chat-panel') || $('#chat-panel', overviewRoot);
-  $('.overview-chat-slot', overviewRoot).append(chatPanel);
-  chatPanel.hidden = false;
-  updateChatExpansion(); overviewProgress();
-  const tree = $('.overview-tree', overviewRoot); tree.replaceChildren();
+  tree.replaceChildren();
   if (state.reports.length || state.report_drafts.length) {
     const select = el('select', 'overview-report-select'); select.setAttribute('aria-label', 'Версия отчёта');
     [...state.report_drafts].reverse().forEach(d => { const o = el('option', '', `${draftLabel(d)} · ${new Date(d.created_at).toLocaleString('ru')}`); o.value = 'draft:' + d.id; select.append(o); });
@@ -468,18 +581,58 @@ function renderOverviewWorkspace(container) {
     tree.append(select);
   }
   tree.append(el('p', 'eyebrow', 'НАВИГАЦИЯ ПО ОТЧЁТУ'));
-  overviewTreeGroup(tree, 'Описание', 'summary', null, null);
+  const filters = el('div', 'tree-filters');
+  for (const [name, label, checked] of [['tests', 'Тесты', showTests], ['docs', 'Документация', showDocs]]) {
+    const wrapper = el('label', 'checkbox-label');
+    const input = document.createElement('input'); input.type = 'checkbox'; input.checked = checked;
+    input.dataset.fileFilter = name;
+    input.onchange = () => { if (name === 'tests') showTests = input.checked; else showDocs = input.checked; renderOverviewTree(name); };
+    wrapper.append(input, document.createTextNode(label)); filters.append(wrapper);
+  }
+  tree.append(filters);
+  overviewTreeGroup(tree, 'Описание', 'summary', null, null, open, statsByPath);
   if (displayedReport?.findings?.length) {
-    tree.append(el('p', 'tree-heading', `Проблемы · ${displayedReport.findings.length}`));
-    displayedReport.findings.forEach(f => overviewTreeGroup(tree, f.title, 'finding', f.id, f, 0));
+    overviewTreeSection(tree, `Проблемы · ${displayedReport.findings.length}`, 'section:findings',
+      displayedReport.findings.map(f => ({...f, kind: 'finding'})), open, statsByPath);
   }
   if (displayedReport?.items?.length) {
-    let section = '';
+    const sections = new Map();
     displayedReport.items.forEach(item => {
-      if (section !== item.section) { section = item.section; tree.append(el('p', 'tree-heading', section)); }
-      overviewTreeGroup(tree, item.title, 'item', item.id, item);
+      if (!sections.has(item.section)) sections.set(item.section, []);
+      sections.get(item.section).push({...item, kind: 'item'});
     });
+    for (const [name, items] of sections) overviewTreeSection(tree, name, `section:item:${name}`, items, open, statsByPath);
   }
+  tree.scrollTop = previousScroll;
+  if (focusFilter) $(`[data-file-filter="${focusFilter}"]`, tree)?.focus();
+}
+function renderOverviewWorkspace(container) {
+  const rootKey = `${reportSelection}:${displayed.id}`;
+  if (!overviewRoot || overviewRootKey !== rootKey) {
+    overviewResizeObserver?.disconnect(); overviewEditorResizeObserver?.disconnect(); overviewEditor?.destroy(); overviewEditor = null; overviewEditorKey = ''; overviewRootKey = rootKey;
+    overviewTarget = {kind: 'summary', id: null}; overviewFile = null; overviewLayer = null;
+    overviewMode = 'frozen'; overviewUnsaved = false; overviewSelection = [];
+    overviewRoot = el('div', 'overview-workspace');
+    const grid = el('div', 'overview-grid');
+    const center = el('div', 'overview-center');
+    const detail = el('section', 'overview-detail'); detail.id = 'overview-detail';
+    const diff = el('section', 'overview-diff'); diff.id = 'overview-diff';
+    const splitter = el('div', 'overview-splitter'); splitter.tabIndex = 0;
+    splitter.setAttribute('role', 'separator'); splitter.setAttribute('aria-label', 'Разделитель текста и диффа');
+    splitter.setAttribute('aria-orientation', 'horizontal'); splitter.setAttribute('aria-controls', 'overview-detail overview-diff');
+    splitter.setAttribute('aria-valuemin', '0'); splitter.setAttribute('aria-valuemax', '100');
+    setupOverviewSplitter(splitter);
+    center.append(detail, splitter, diff, el('div', 'overview-chat-slot'));
+    grid.append(center); overviewRoot.append(grid);
+    overviewResizeObserver = new ResizeObserver(updateOverviewSplit); overviewResizeObserver.observe(center);
+  }
+  container.append(overviewRoot);
+  $('.page-heading').hidden = true;
+  const chatPanel = $('#chat-panel') || $('#chat-panel', overviewRoot);
+  $('.overview-chat-slot', overviewRoot).append(chatPanel);
+  chatPanel.hidden = false;
+  updateChatExpansion(); overviewProgress();
+  renderOverviewTree();
   renderOverviewDetail();
   void renderOverviewDiff();
   requestAnimationFrame(updateOverviewSplit);

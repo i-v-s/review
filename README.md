@@ -86,6 +86,30 @@ An empty setting keeps the existing transport. Update an existing installation w
 
 ## Workflow
 
+The left sidebar shows the workspace menu or, when a report or draft is selected,
+the report tree. **WORKSPACE / Обзор** returns to the menu. Report sections and their
+file lists start collapsed; their expanded state and the sidebar width are saved in
+the browser for each repository (and, for tree sections, each report version). Drag
+the sidebar edge or use its arrow keys to change its width.
+
+The tree omits staged file entries. Each working file shows added and removed diff
+line counts. Test and documentation files appear only after checking **Тесты** or
+**Документация**. To replace the built-in path rules, create `.review.toml` in the
+reviewed repository:
+
+```toml
+[file_filters]
+tests = ["tests/*", "*/tests/*", "*.test.*"]
+docs = ["docs/*", "*.md"]
+```
+
+Both lists are required; either may be empty. Patterns match the full relative path
+without regard to letter case: `*` matches any number of characters, including `/`,
+and `?` matches one character. A path matching both lists is treated as a test.
+Without `.review.toml`, the service recognizes common test names and `tests/`
+directories, plus `docs/`, README, Markdown, reStructuredText, and AsciiDoc files.
+Restart the service after changing `.review.toml`.
+
 1. Before development, select **Начать новую работу**. Current changes become the
    baseline. If you connect later, the report is marked retrospective.
 2. In **Источники**, select Codex/OpenCode sessions, import an OpenCode export, or

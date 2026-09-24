@@ -89,3 +89,52 @@
   .overview-main>#job-status:not([hidden]){top:calc(var(--header-height) + var(--sidebar-height) + 64px)}
 }
 @media(max-width:700px){.topbar{height:auto}.layout > .chat-panel{top:0;height:100dvh}}
+
+/* The workspace menu and report tree share one resizable sidebar. */
+#workspace{--sidebar-width:250px}
+.sidebar{position:sticky;top:var(--header-height);align-self:flex-start;flex:0 0 var(--sidebar-width);width:var(--sidebar-width);height:calc(100dvh - var(--header-height));padding:0;overflow:hidden;border-right:0}
+.sidebar-view{display:flex;flex-direction:column;min-width:0;min-height:0;height:100%}
+#sidebar-workspace{padding:30px 18px}
+#sidebar-workspace>.eyebrow{padding-left:13px}
+#sidebar-report{background:#fafcf9}
+.sidebar-report-header{flex:none;display:flex;align-items:center;gap:5px;min-height:48px;padding:0 13px;border-bottom:1px solid var(--line);background:#fafbf7;font-size:12px;font-weight:650}
+.sidebar-report-header button{padding:7px 2px;color:var(--green);font-size:11px;letter-spacing:.7px}
+.sidebar-report-header span{color:var(--muted)}
+.sidebar .overview-tree{flex:1;min-height:0;overflow:auto;width:100%;padding:12px 9px 22px;border-right:0;display:block}
+.sidebar .overview-tree .eyebrow{margin:17px 9px 9px}
+.tree-filters{display:flex;flex-wrap:wrap;gap:7px 11px;margin:0 8px 13px}
+.tree-filters .checkbox-label{font-size:11px;white-space:nowrap}
+.tree-row,.tree-section-row{display:flex;align-items:center;min-width:0}
+.tree-row .tree-entry{flex:1;width:auto;min-width:0;margin:0}
+.tree-disclosure,.tree-disclosure-spacer{flex:0 0 21px;width:21px;height:28px;display:inline-grid;place-items:center;color:var(--muted);padding:0}
+.tree-disclosure:hover{background:var(--soft);color:var(--green)}
+.tree-section-row{margin:16px 5px 5px}
+.tree-section-row .tree-heading{margin:0 0 0 3px;flex:1}
+.tree-children{padding-left:14px}
+.tree-entry{align-items:center;gap:5px}
+.tree-label{flex:1;min-width:0;overflow-wrap:anywhere}
+.tree-add,.tree-delete{flex:none;font:10px var(--mono)}
+.tree-add{color:#2e7550}.tree-delete{color:var(--danger)}
+.tree-badge{flex:none}
+.sidebar-splitter{position:sticky;top:var(--header-height);align-self:flex-start;flex:0 0 8px;width:8px;height:calc(100dvh - var(--header-height));background:#e8eee5;border-inline:1px solid #d4ddd1;cursor:col-resize;touch-action:none}
+.sidebar-splitter:hover,.sidebar-splitter.dragging,.sidebar-splitter:focus-visible{background:#c8ddc5}
+.sidebar-splitter:before{content:"";position:absolute;top:50%;left:2px;height:36px;width:2px;transform:translateY(-50%);background:#839b86;border-radius:2px}
+.overview-grid{grid-template-columns:minmax(0,1fr)}
+.overview-center{min-width:0;height:100%}
+.overview-main{position:relative}
+.overview-main>#banner,.overview-main>#job-status{left:8px;right:8px;top:8px}
+.overview-main>#job-status:not([hidden]){top:64px}
+@media(max-width:800px){
+  .layout{display:block}
+  .sidebar{position:relative;top:auto;width:100%;height:auto;min-height:0;border-bottom:1px solid var(--line)}
+  .sidebar-view{height:auto}
+  #sidebar-workspace{padding:8px 10px}
+  #sidebar-workspace>.eyebrow,#sidebar-workspace .sidebar-note,#sidebar-workspace .sidebar-footer{display:none}
+  #sidebar-workspace nav{display:flex;gap:3px;overflow-x:auto}
+  #sidebar-workspace .nav-button{padding:10px 9px;white-space:nowrap;width:auto;gap:6px;font-size:11px}
+  #sidebar-report .overview-tree{flex:none;max-height:145px;padding:7px 9px;overflow:auto;border-bottom:0}
+  .sidebar-report-header{min-height:35px}
+  .sidebar-splitter{display:none}
+  .overview-grid{display:grid;grid-template-columns:minmax(0,1fr);height:100%}
+  .overview-center{height:100%}
+}

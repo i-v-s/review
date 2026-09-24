@@ -51,17 +51,24 @@
       <div class="top-actions"><span id="connection" class="connection">Подключение…</span><button id="chat-toggle" class="outline">Спросить AI ↗</button><button id="logout" class="quiet" aria-label="Выйти">Выйти</button></div>
     </header>
     <div class="layout">
-      <aside class="sidebar">
-        <p class="eyebrow">WORKSPACE</p>
-        <nav id="navigation" aria-label="Навигация">
-          <button data-view="overview" class="nav-button active"><span>◫</span>Обзор<span id="review-count" class="nav-count">0</span></button>
-          <button data-view="changes" class="nav-button"><span>±</span>Изменения<span id="change-count" class="nav-count">0</span></button>
-          <button data-view="sources" class="nav-button"><span>☷</span>Источники</button>
-          <button data-view="history" class="nav-button"><span>↶</span>История действий</button>
-        </nav>
-        <div class="sidebar-note"><span class="small-dot"></span><strong>Локальный review</strong><p>Git-действия выполняются на машине репозитория.</p></div>
-        <div class="sidebar-footer"><span>Снимок</span><code id="snapshot-label">—</code><button id="baseline" class="text-button">Начать новую работу</button></div>
+      <aside class="sidebar" id="sidebar">
+        <div id="sidebar-workspace" class="sidebar-view">
+          <p class="eyebrow">WORKSPACE</p>
+          <nav id="navigation" aria-label="Навигация">
+            <button data-view="overview" class="nav-button active"><span>◫</span>Обзор<span id="review-count" class="nav-count">0</span></button>
+            <button data-view="changes" class="nav-button"><span>±</span>Изменения<span id="change-count" class="nav-count">0</span></button>
+            <button data-view="sources" class="nav-button"><span>☷</span>Источники</button>
+            <button data-view="history" class="nav-button"><span>↶</span>История действий</button>
+          </nav>
+          <div class="sidebar-note"><span class="small-dot"></span><strong>Локальный review</strong><p>Git-действия выполняются на машине репозитория.</p></div>
+          <div class="sidebar-footer"><span>Снимок</span><code id="snapshot-label">—</code><button id="baseline" class="text-button">Начать новую работу</button></div>
+        </div>
+        <div id="sidebar-report" class="sidebar-view" hidden>
+          <div class="sidebar-report-header"><button id="sidebar-back" type="button">WORKSPACE</button><span>/ Обзор</span></div>
+          <nav id="report-tree" class="overview-tree" aria-label="Дерево отчёта"></nav>
+        </div>
       </aside>
+      <div id="sidebar-splitter" class="sidebar-splitter" role="separator" tabindex="0" aria-label="Ширина левой панели" aria-orientation="vertical" aria-controls="sidebar main" aria-valuemin="180" aria-valuemax="480" aria-valuenow="250"></div>
       <main id="main">
         <div class="page-heading"><div><p class="eyebrow">ОТ НАМЕРЕНИЯ К РЕАЛИЗАЦИИ</p><h1 id="page-title">Обзор изменений</h1><p id="page-subtitle" class="muted">Проверьте решения. Соберите следующий коммит.</p></div></div>
         <div id="banner" class="banner" hidden></div>
